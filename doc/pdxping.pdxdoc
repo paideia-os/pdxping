@@ -1,0 +1,55 @@
+%%% pdxdoc-source v0.1
+%%% This is the source form of the .pdxdoc file that `doc pdxping`
+%%% renders. Format hardening lands with doc.M1-002 (paideia-os plan
+%%% §5.3); this source lives in the repo under version control and a
+%%% future release tool ships the compiled `.pdxdoc` alongside the
+%%% binary into /pkgs/pdxping-1.0.0/doc/pdxping.pdxdoc.
+%%%
+%%% Section markers: a bare `==== <title>` line opens a section. Cross-
+%%% references use `[[cref: <target>]]` where <target> is either a
+%%% doc-local section title or a `<tool>#<section>` fully-qualified
+%%% reference the reader resolves against /system/doc/.
+
+==== NAME
+pdxping -- minimal ICMP echo CLI, the first exerciser of the
+R_NET_PRIVILEGED_PROTOCOL elevate class.
+
+==== SYNOPSIS
+    pdxping [--count=N] [--interval-ms=N] [--timeout-ms=N] [--dry-run] <host>
+
+Defaults: count=4, interval-ms=1000, timeout-ms=1000. `<host>` is
+required; no default.
+
+==== DESCRIPTION
+`pdxping` is a standalone ring-3 ELF -- its own `_start`, no shared
+library, no dynamic linker. It is deliberately small: one echo per
+syscall, one blocking wait for the matching reply, no traceroute, no
+MTU discovery, no flood mode (`design/networking/r100-user-tools-plan.md`
+§5, paideia-os repo).
+
+At v1.0.0 (Wave AA cohort), only the `--dry-run` path is real:
+`--count` `PingRecord@0.1` records are built and their 128 raw bytes
+previewed to fd 2 as a hex dump, one per iteration, no network I/O.
+A non-`--dry-run` invocation calls the `R_NET_PRIVILEGED_PROTOCOL`
+elevate gate before any echo attempt; the gate is a fail-closed WEAK
+stub at this landing (no broker-endpoint cap is provisioned to this
+tool), so every non-`--dry-run` invocation exits 13 with
+`[pdxping.M3-001 EACCES]` on fd 2. Real `sys_icmp_echo` (sysno 103,
+landed kernel-side at R100-PREP-003) dispatch is M2 scope, not yet
+implemented in this repo.
+
+==== EXIT STATUS
+    0   OK (--dry-run completed; every PingRecord@0.1 previewed)
+    2   argv error (missing <host>, unknown flag, malformed numeric value)
+    13  R_NET_PRIVILEGED_PROTOCOL elevate refused (fail-closed; every
+        non---dry-run invocation at this landing)
+
+==== LIMITATIONS
+See CHANGELOG.md "Known deferred substrate": M2 (real echo, RTT
+stats) is out of scope for the Wave AA cohort; `libpdx-elevate` and
+`libpdx-audit` integration are WEAK stubs pending a real cross-repo
+link path.
+
+==== SEE ALSO
+[[cref: pdxcurl#NAME]], [[cref: pdxsock#NAME]], [[cref: pdxdig#NAME]]
+-- sibling tools in the R100 user-space networking wave.

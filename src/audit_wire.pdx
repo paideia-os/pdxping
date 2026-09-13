@@ -1,0 +1,95 @@
+// src/audit_wire.pdx — pdxping.M3-002 (#7): libpdx-audit per-echo
+// record (WEAK stub).
+//
+// Scope
+// -----
+// This module implements pdxping#7 (M3-002): "libpdx-audit: one record
+// per echo (not per session)." `src/entry.pdx` calls
+// `pdxping_audit_echo` once per echo ATTEMPT -- once per `--count`
+// loop iteration in the `--dry-run` path (`result_code =
+// PingRecord::PR_RESULT_DRY_RUN`), and once for the M3-001 elevate
+// refusal in the non---dry-run path (`result_code =
+// PingRecord::PR_RESULT_NO_PERMISSION`) -- never once per whole
+// session, per this issue's own explicit instruction.
+//
+// STUB status (this landing) --------------------------------------------
+// The intended real body calls
+//   `audit_file_append("/system/audit/pdxping.log", <path_len>,
+//                       <line_ptr>, <line_len>)`
+// -- libpdx-audit's real, LANDED entry point
+// (`tools/user/libpdx-audit/src/audit_file_sink.pdx`, function
+// `audit_file_append`, signature `(u64, u64, u64, u64) -> u64`). Unlike
+// `libpdx-elevate`'s own `AuditSink` consumer (which WEAK-stubs against
+// this SAME function because, at the time that library wrote its own
+// stub, `audit_file_append` had not yet landed upstream), the gap here
+// is purely a LINK-PATH gap, not a missing-upstream-symbol gap:
+// `libpdx-audit` is a satellite repo this standalone `pdxping` build
+// does not currently vendor, build alongside, or link against
+// (`manifest.pdxproj`'s `deps:` list is empty; `tools/build.sh` has no
+// `--extra-obj-dir`/`--extra-archive` invocation naming it). Wiring the
+// real dependency is a follow-up (see `manifest.pdxproj`'s own
+// "Library dependencies" comment): add `libpdx-audit` to `deps:`,
+// extend `tools/build.sh`'s invocation with
+// `--extra-archive .../libpdx-audit-satellite.a` (the same archive
+// `mount.pdxfs`/`umount.pdxfs` already link against, per
+// `pdxsock`'s own build precedent), narrow `caps.decl`'s
+// `KIND_IPC_ENDPOINT` placeholder row to mandatory, and swap this
+// file's body for a real call -- with NO change to `src/entry.pdx`'s
+// call sites, since this function's argument ABI is frozen now.
+//
+// Until that lands, `pdxping_audit_echo` is a no-op `xor rax, rax;
+// ret`, returning `AUDIT_OK` (0) -- the exact WEAK-stub shape
+// `pdxsock`'s own `src/audit_wire.pdx` (`pdxsock_audit_session_start`/
+// `_close`) documents for the analogous gap in that sibling R100-wave
+// repo.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module AuditWire (PascalCase basename).
+//   - <= 4 curried arguments (pdxping_audit_echo takes 3: seq,
+//     result_code, rtt_ns).
+//   - Leaf; no push/pop; writes only rax.
+//   - No test mnemonic (no branch in the stub body).
+//
+// Upstream: design/networking/r100-user-tools-plan.md §5.5 (paideia-os,
+// "one record per echo (not per session)"); tools/user/libpdx-audit/
+// src/audit_file_sink.pdx (the real, landed audit_file_append this
+// stub's future real body will call); pdxsock's src/audit_wire.pdx
+// (the identical WEAK-stub shape and STUB-status write-up structure
+// this file's own header is adapted from).
+
+module AuditWire = structure {
+
+  pub let AUDIT_OK : u64 = 0
+
+  // --- Intended real-call target path (documentation only at this
+  //     landing -- the stub body below never reads these). The real
+  //     body will pass AW_PATH's address + AW_PATH_LEN as
+  //     audit_file_append's first two arguments. -----------------------
+  pub let AW_PATH     : [u8; 27] = "/system/audit/pdxping.log\0"
+  pub let AW_PATH_LEN : u64 = 26
+
+  // ============================================================================
+  // pdxping_audit_echo(seq, result_code, rtt_ns) -> u64
+  //
+  //   rdi = seq          (echo sequence number, 0-based)
+  //   rsi = result_code  (PingRecord::PR_RESULT_* -- OK/TIMEOUT/
+  //                        UNREACHABLE/NO_PERMISSION/DRY_RUN)
+  //   rdx = rtt_ns        (0 when no real echo was attempted, e.g.
+  //                        --dry-run or an elevate refusal)
+  //   rax = AUDIT_OK (0) -- the STUB always succeeds trivially, since
+  //         it performs no I/O to fail at.
+  //
+  // Called once per echo ATTEMPT (see file header) -- never once per
+  // whole session.
+  // ============================================================================
+  pub let pdxping_audit_echo : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (seq: u64) (result_code: u64) (rtt_ns: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "pdxping.M3-002 (#7) pdxping_audit_echo. WEAK stub -- see file header for the full STUB-status writeup (a link-path gap, not a missing-upstream-symbol gap: libpdx-audit's real audit_file_append is landed upstream at tools/user/libpdx-audit/src/audit_file_sink.pdx but this standalone repo does not yet vendor/link that satellite). Body: xor rax,rax; ret -- sets AUDIT_OK (0), discards all three arguments (seq, result_code, rtt_ns), touches no memory or sysreg despite the declared !{mem, sysreg} @{fs} effect set -- the wider declaration intentionally mirrors what the real audit_file_append body requires (that function declares !{mem, sysreg} @{fs} per its own file header: mem for the path/line byte-copy staging, sysreg for its three raw `syscall` instructions, @{fs} because sys_open/sys_write/sys_close are filesystem-gated) so main.pdx's call-site ABI survives the swap-to-real landing without a re-type, matching pdxsock's own AuditWire module's identical convention. Leaf; no push/pop; writes only rax. Arguments (rdi/rsi/rdx, all caller-save) may be freely discarded by this body. No test mnemonic (no branch in this body at all). Labels: none (straight-line body).",
+      block: {
+        xor rax, rax;
+        ret;
+      }
+    }
+}

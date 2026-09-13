@@ -1,0 +1,358 @@
+// src/argv_parse.pdx — pdxping.M1-002 (#2): argv surface.
+//
+// Scope
+// -----
+// This module implements pdxping#2 (M1-002): "argv surface --count,
+// --interval-ms, --timeout-ms, --dry-run, <host>." It is a hand-rolled
+// byte scanner (no libpdx-argv link -- pdxsock's own v1.2.x landings
+// in this same R100 wave take the identical posture: a small tool's
+// M1/M2 argv surface is hand-rolled, with a `libpdx-argv` migration
+// deferred to a future M1-00x, same as rm/mount.pdxfs/umount.pdxfs
+// were before their own libpdx-argv adoption passes).
+//
+// Grammar
+// -------
+//   pdxping [--count=N] [--interval-ms=N] [--timeout-ms=N] [--dry-run] <host>
+//
+// Defaults: count=4, interval-ms=1000, timeout-ms=1000. `<host>` is
+// required (no default) -- exactly one non-flag positional. Any
+// unrecognized `--flag`, a malformed numeric value on `--count=`/
+// `--interval-ms=`/`--timeout-ms=`, more than one positional, or zero
+// positionals all return `AP_ERR`.
+//
+// Output shape (ParsedArgv, 40 bytes, caller-supplied .bss buffer)
+// ------------------------------------------------------------------
+//   +0  count       u64
+//   +8  interval_ms u64
+//   +16 timeout_ms  u64
+//   +24 flags       u64   (bit0 = AP_FLAG_DRY_RUN)
+//   +32 host_ptr    u64   (NUL-terminated argv pointer; 0 = unset)
+//
+// paideia-as compliance
+// ---------------------
+//   - Module ArgvParse (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm <= 0x7FFFFFFF (largest is the SIB scale-8
+//     argv walk bound, itself a register-register compare, not an
+//     immediate).
+//   - No `and` on r8-r15 anywhere in this file.
+//   - No 2-op imul; no neg; no sil/dil/bl aliases (byte loads route
+//     through xor rax,rax; mov_b rax,[ptr] per #1248).
+//   - <= 4 curried arguments on every function (argv_parse itself
+//     takes exactly 3: argc, argv, out_ptr).
+//   - SIB scale-8 argv indexing (`[r13 + r15*8]`) -- an established
+//     safe idiom throughout this tree (cat/argv_dispatch.pdx,
+//     cp/copy.pdx, mv/entry.pdx all use it for argv[]/array walks).
+//   - Reserved-label discipline: every branch label below is prefixed
+//     `ap_` (disjoint from `loop`/`if`/other paideia-as keywords).
+//
+// Upstream: design/networking/r100-user-tools-plan.md §5.1 (paideia-os,
+// the frozen argv grammar); design/user/execve-abi.md (the frozen
+// argc/argv register ABI src/entry.pdx's `_start` consumes and passes
+// straight through to this module).
+
+module ArgvParse = structure {
+
+  // --- Return codes. ------------------------------------------------------
+  pub let AP_OK  : u64 = 0
+  pub let AP_ERR : u64 = 1
+
+  // --- Output struct layout (documentation; see file header). -------------
+  pub let AP_OFF_COUNT       : u64 = 0
+  pub let AP_OFF_INTERVAL_MS : u64 = 8
+  pub let AP_OFF_TIMEOUT_MS  : u64 = 16
+  pub let AP_OFF_FLAGS       : u64 = 24
+  pub let AP_OFF_HOST_PTR    : u64 = 32
+  pub let AP_STRUCT_BYTES    : u64 = 40
+
+  pub let AP_FLAG_DRY_RUN : u64 = 0x1
+
+  // --- Defaults. ------------------------------------------------------------
+  pub let AP_DEFAULT_COUNT       : u64 = 4
+  pub let AP_DEFAULT_INTERVAL_MS : u64 = 1000
+  pub let AP_DEFAULT_TIMEOUT_MS  : u64 = 1000
+
+  // --- Flag-prefix patterns (raw byte arrays, no implicit NUL -- lengths
+  //     are exact byte counts passed separately to _ap_match_prefix). ------
+  pub let AP_PAT_COUNT    : [u8; 8]  = "--count="
+  pub let AP_PAT_INTERVAL : [u8; 14] = "--interval-ms="
+  pub let AP_PAT_TIMEOUT  : [u8; 13] = "--timeout-ms="
+
+  // --dry-run has no value, so the pattern includes the trailing NUL
+  // (10 bytes) to force an EXACT match rather than a mere prefix match
+  // (a hypothetical "--dry-runX" argv token must NOT match).
+  pub let AP_PAT_DRYRUN : [u8; 10] = "--dry-run\0"
+
+  // ============================================================================
+  // _ap_match_prefix(str_ptr, pat_ptr, pat_len) -> u64
+  //
+  //   rdi = str_ptr (NUL-terminated argv token; may be longer than pat)
+  //   rsi = pat_ptr (raw byte pattern, no implicit NUL)
+  //   rdx = pat_len
+  //   rax = 1 if str_ptr's first pat_len bytes equal pat_ptr's bytes,
+  //         else 0
+  //
+  // Pure leaf: rax, rcx, r8, r9, r10 are all SysV caller-save; no
+  // push/pop. Does not touch rbx/r12-r15, so a caller's use of those as
+  // long-lived locals across this call is automatically preserved.
+  // ============================================================================
+  pub let _ap_match_prefix : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (str_ptr: u64) (pat_ptr: u64) (pat_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxping.M1-002 (#2) _ap_match_prefix. Byte-by-byte compare of str_ptr[0..pat_len) against pat_ptr[0..pat_len). rcx = index 0..pat_len; r8 = &str_ptr[i] (mov r8,rdi; add r8,rcx), r9 = &pat_ptr[i] (mov r9,rsi; add r9,rcx); both bytes loaded via xor+mov_b (#1248) into rax and r10 respectively, compared with cmp rax,r10. Any mismatch -> rax=0, ret. Full pat_len run with no mismatch -> rax=1, ret. Pure leaf -- rax,rcx,r8,r9,r10,rdi,rsi,rdx all SysV caller-save; no push/pop; never touches rbx/r12-r15 so a caller holding long-lived locals there across this call needs no save/restore of its own. No test mnemonic (cmp reg,reg / cmp reg,0 throughout). No `and` anywhere. Labels prefixed ap_mp_.",
+      block: {
+        xor rcx, rcx;
+
+      ap_mp_head:
+        cmp rcx, rdx;
+        jge ap_mp_match;
+
+        mov r8, rdi;
+        add r8, rcx;
+        xor rax, rax;
+        mov_b rax, [r8];
+
+        mov r9, rsi;
+        add r9, rcx;
+        xor r10, r10;
+        mov_b r10, [r9];
+
+        cmp rax, r10;
+        jne ap_mp_nomatch;
+
+        add rcx, 1;
+        jmp ap_mp_head;
+
+      ap_mp_match:
+        mov rax, 1;
+        ret;
+
+      ap_mp_nomatch:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // _ap_parse_u64(str_ptr) -> (ok in rax, val in rdx)
+  //
+  // Grammar: [0-9]+ terminated by NUL. No sign, no whitespace, no
+  // suffix, no overflow guard (pdxping's numeric flags are small counts
+  // / millisecond durations; a pathological caller-supplied value that
+  // overflows u64 via *10+digit accumulation simply wraps -- acceptable
+  // at this milestone, unlike libpdx-argv's own hardened
+  // Typed::parse_int_u64, which this function is a deliberately
+  // simplified sibling of, not a competitor to).
+  //
+  // Pure leaf: rax, rcx, r8, r9, rdi are SysV caller-save; no push/pop.
+  // ============================================================================
+  pub let _ap_parse_u64 : (u64) -> u64 !{mem} @{} =
+    fn (str_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxping.M1-002 (#2) _ap_parse_u64. rcx = accumulator (0 init), r8 = digit_count (0 init), r9 = read cursor (= str_ptr). Per byte: xor rax,rax; mov_b rax,[r9] (#1248); rax==0 -> end-of-string, break to finalize; rax<0x30 or rax>0x39 -> not a digit, fail; else digit=rax-0x30 (via sub, not the banned neg), acc = acc*10+digit computed WITHOUT imul as (acc<<3)+(acc<<2 via a second shl<<1 then add, i.e. acc*8 + acc*2) using r10/r11 scratch, digit_count+=1, cursor+=1, loop. End: digit_count==0 -> fail (empty string never parses); else ok=1, val=acc. Fail path zeroes both return registers. Pure leaf -- rax,rcx,r8,r9,r10,r11,rdi,rdx all SysV caller-save; no push/pop. No test mnemonic (cmp reg,imm throughout; largest imm is 0x39=57, well within imm32). No `and` anywhere; no imul/mul; no neg (digit extraction uses sub). Labels prefixed ap_pu_.",
+      block: {
+        xor rcx, rcx;                       // acc = 0
+        xor r8, r8;                         // digit_count = 0
+        mov r9, rdi;                        // cursor = str_ptr
+
+      ap_pu_head:
+        xor rax, rax;
+        mov_b rax, [r9];
+
+        cmp rax, 0;
+        je ap_pu_end;
+
+        cmp rax, 0x30;                      // '0'
+        jl ap_pu_fail;
+        cmp rax, 0x39;                      // '9'
+        jg ap_pu_fail;
+
+        sub rax, 0x30;                      // digit value 0..9
+
+        // acc = acc*10 + digit, via (acc<<3) + (acc<<1) + digit -- no imul.
+        mov r10, rcx;
+        shl r10, 3;                         // r10 = acc*8
+        mov r11, rcx;
+        shl r11, 1;                         // r11 = acc*2
+        add r10, r11;                       // r10 = acc*10
+        add r10, rax;                       // r10 = acc*10 + digit
+        mov rcx, r10;
+
+        add r8, 1;
+        add r9, 1;
+        jmp ap_pu_head;
+
+      ap_pu_end:
+        cmp r8, 0;
+        je ap_pu_fail;
+        mov rax, 1;                         // ok = 1
+        mov rdx, rcx;                       // val
+        ret;
+
+      ap_pu_fail:
+        xor rax, rax;
+        xor rdx, rdx;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // argv_parse(argc, argv, out_ptr) -> u64
+  //
+  //   rdi = argc
+  //   rsi = argv  (own-address-space VA of a char*[]; design/user/
+  //                execve-abi.md -- no walker/syscall needed to
+  //                dereference argv[i])
+  //   rdx = out_ptr (caller-owned 40-byte .bss ParsedArgv scratch)
+  //   rax = AP_OK (0) | AP_ERR (1)
+  //
+  // Writes the four defaults + a zeroed flags/host_ptr into *out_ptr
+  // BEFORE scanning, so a caller sees well-defined defaults even on the
+  // AP_ERR path (though _start does not print anything from *out_ptr on
+  // that path -- it prints a fixed usage string instead).
+  //
+  // Register plan: 5-push prologue (rbx=arg_ptr scratch, r12=argc,
+  // r13=argv, r14=out_ptr, r15=i) -- entry rsp%16==8 (post-CALL SysV),
+  // 5 pushes (40 bytes) lands rsp%16==0 for every nested call
+  // (_ap_match_prefix, _ap_parse_u64 -- neither touches rbx/r12-r15, so
+  // no per-call save/restore is needed beyond this one prologue).
+  // ============================================================================
+  pub let argv_parse : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (argc: u64) (argv: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxping.M1-002 (#2) argv_parse entry point. 5-push prologue (rbx/r12/r13/r14/r15, 40 bytes) lands rsp%16==0 from entry 8, covering every nested call in this function (_ap_match_prefix, _ap_parse_u64 -- both leaf, neither touches rbx/r12-r15). r12=argc, r13=argv, r14=out_ptr, r15=loop index i (starts at 1, skipping argv[0]=program name), rbx=argv[i] (reloaded fresh each iteration via SIB scale-8: mov rbx,[r13+r15*8]). Phase 0: write the three numeric defaults (4/1000/1000) plus flags=0 and host_ptr=0 into *out_ptr. Phase 1 (per-token scan, i=1..argc): four candidate matches in order -- --count= (8 bytes), --interval-ms= (14 bytes), --timeout-ms= (13 bytes), --dry-run (10 bytes incl. NUL, forcing an exact match) -- each via _ap_match_prefix(rbx, &PAT, len); on a value-flag match the value substring starts at rbx+len (already NUL-terminated as part of the same argv token, no split needed) and is parsed via _ap_parse_u64; a parse failure (rax==0) is AP_ERR immediately (ap_err). On no flag match: a raw two-byte '-','-' prefix check (byte loads via xor+mov_b, #1248) distinguishes an unrecognized long flag (AP_ERR) from a positional (single-dash or no-dash tokens fall through as positionals too -- pdxping's grammar has no short flags, so this is a deliberately permissive fallback, not a POSIX-shape decision). A positional sets out_ptr+32 (host_ptr) iff it is currently 0; a second positional is AP_ERR (too many). Phase 2 (post-scan): host_ptr still 0 -> AP_ERR (missing target); else AP_OK. Encoder discipline: no test mnemonic (cmp reg,0/cmp reg,imm throughout); every cmp reg,imm <= 0x2D (ASCII '-'), well within imm32; no `and` anywhere in this function; no imul/mul/neg; byte loads via xor rax,rax + mov_b (#1248); SIB scale-8 argv indexing (`[r13+r15*8]`), an established safe idiom in this tree. Labels prefixed ap_ (ap_scan_/ap_positional/ap_err/ap_ok, disjoint from paideia-as keywords `loop`/`if`).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                       // r12 = argc
+        mov r13, rsi;                       // r13 = argv
+        mov r14, rdx;                       // r14 = out_ptr
+
+        // ---- Phase 0: defaults. ---------------------------------------------
+        mov rax, 4;                         // AP_DEFAULT_COUNT
+        mov [r14 + 0], rax;                 // AP_OFF_COUNT
+        mov rax, 1000;                      // AP_DEFAULT_INTERVAL_MS
+        mov [r14 + 8], rax;                 // AP_OFF_INTERVAL_MS
+        mov rax, 1000;                      // AP_DEFAULT_TIMEOUT_MS
+        mov [r14 + 16], rax;                // AP_OFF_TIMEOUT_MS
+        xor rax, rax;
+        mov [r14 + 24], rax;                // AP_OFF_FLAGS = 0
+        mov [r14 + 32], rax;                // AP_OFF_HOST_PTR = 0
+
+        mov r15, 1;                         // i = 1 (skip argv[0])
+
+      ap_scan_head:
+        cmp r15, r12;
+        jge ap_scan_done;
+
+        mov rbx, [r13 + r15*8];             // rbx = argv[i]
+
+        // ---- try --count= ----------------------------------------------------
+        mov rdi, rbx;
+        lea rsi, [rip + AP_PAT_COUNT];
+        mov rdx, 8;
+        call _ap_match_prefix;
+        cmp rax, 0;
+        je ap_try_interval;
+
+        mov rdi, rbx;
+        add rdi, 8;
+        call _ap_parse_u64;
+        cmp rax, 0;
+        je ap_err;
+        mov [r14 + 0], rdx;                 // AP_OFF_COUNT
+        jmp ap_scan_next;
+
+      ap_try_interval:
+        mov rdi, rbx;
+        lea rsi, [rip + AP_PAT_INTERVAL];
+        mov rdx, 14;
+        call _ap_match_prefix;
+        cmp rax, 0;
+        je ap_try_timeout;
+
+        mov rdi, rbx;
+        add rdi, 14;
+        call _ap_parse_u64;
+        cmp rax, 0;
+        je ap_err;
+        mov [r14 + 8], rdx;                 // AP_OFF_INTERVAL_MS
+        jmp ap_scan_next;
+
+      ap_try_timeout:
+        mov rdi, rbx;
+        lea rsi, [rip + AP_PAT_TIMEOUT];
+        mov rdx, 13;
+        call _ap_match_prefix;
+        cmp rax, 0;
+        je ap_try_dryrun;
+
+        mov rdi, rbx;
+        add rdi, 13;
+        call _ap_parse_u64;
+        cmp rax, 0;
+        je ap_err;
+        mov [r14 + 16], rdx;                // AP_OFF_TIMEOUT_MS
+        jmp ap_scan_next;
+
+      ap_try_dryrun:
+        mov rdi, rbx;
+        lea rsi, [rip + AP_PAT_DRYRUN];
+        mov rdx, 10;
+        call _ap_match_prefix;
+        cmp rax, 0;
+        je ap_try_longflag;
+
+        mov rax, 1;                         // AP_FLAG_DRY_RUN
+        mov [r14 + 24], rax;                // AP_OFF_FLAGS
+        jmp ap_scan_next;
+
+      ap_try_longflag:
+        xor rax, rax;
+        mov_b rax, [rbx + 0];
+        cmp rax, 0x2D;                      // '-'
+        jne ap_positional;
+        xor rax, rax;
+        mov_b rax, [rbx + 1];
+        cmp rax, 0x2D;                      // '-'
+        jne ap_positional;
+        jmp ap_err;                         // unrecognized long flag
+
+      ap_positional:
+        mov rax, [r14 + 32];                // AP_OFF_HOST_PTR
+        cmp rax, 0;
+        jne ap_err;                         // extra positional
+        mov [r14 + 32], rbx;                // AP_OFF_HOST_PTR = argv[i]
+
+      ap_scan_next:
+        add r15, 1;
+        jmp ap_scan_head;
+
+      ap_scan_done:
+        mov rax, [r14 + 32];                // AP_OFF_HOST_PTR
+        cmp rax, 0;
+        je ap_err;                          // missing target
+
+        xor rax, rax;                       // AP_OK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ap_err:
+        mov rax, 1;                         // AP_ERR
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+}

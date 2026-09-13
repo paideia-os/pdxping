@@ -1,0 +1,469 @@
+// src/ping_record.pdx — pdxping.M1-003 (#3): PingRecord@0.1 wire shape
+// + --dry-run hex preview.
+//
+// Scope
+// -----
+// This module implements pdxping#3 (M1-003): "--dry-run prints the
+// PingRecord it would emit." It owns the 128-byte on-wire record
+// shape, a placeholder host hash, and the fd-2 hex-preview writer
+// `--dry-run` calls once per `--count` iteration (src/entry.pdx).
+//
+// Wire shape reconciliation (issue text vs. exact byte count)
+// -------------------------------------------------------------
+// pdxping#3's own text specifies `{version:u32, op:u32,
+// host_hash_lo/hi:u64, count:u64, timeout_ms:u64, reserved[10×u64]}
+// = 128B`. Summing the named fields literally: version(4) + op(4) +
+// host_hash_lo(8) + host_hash_hi(8) + count(8) + timeout_ms(8) = 40
+// bytes, plus `reserved[10]×u64` = 80 bytes, totals 120 bytes — 8
+// bytes short of the issue's own stated 128B target. Rather than
+// silently ship a 120-byte record under a "128B" label (a genuine
+// correctness bug the moment a consumer trusts the stated size),
+// `PR_RESERVED_WORDS` below is **11**, not 10: 40 + 11*8 = 128,
+// exactly. Every other field matches the issue text byte-for-byte.
+// Flagged here for main's review per this cohort's own dispatch note
+// on pdx encoder pitfalls demanding byte-exact precision.
+//
+// Host hash — WEAK, non-cryptographic, placeholder
+// -------------------------------------------------
+// `_pr_hash_host` is a two-accumulator djb2-family string hash
+// (multiply-by-33 for the low half via `(h<<5)+h`, multiply-by-31 for
+// the high half via `(h<<5)-h`, both avoiding `imul`/`mul` per this
+// codebase's imul-avoidance convention for compile-time-constant
+// multiplication). It is NOT a cryptographic hash and makes no
+// collision-resistance claim — it exists so `host_hash_lo/hi` carry
+// *some* deterministic function of the host string at a landing where
+// no BLAKE3 (or any hash) intrinsic is linkable into this standalone
+// repo. Same "aspirational field, honest placeholder body" posture
+// `pdxtrust`'s planned `TrustAnchorRecord::key_hash` documents for its
+// own BLAKE3-pending field (design/networking/r100-user-tools-plan.md
+// §8.3). Upgrading to a real BLAKE3-256 truncation, once linkable, is
+// a body-only swap — `PingRecord::pdxping_record_build`'s signature
+// does not change.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module PingRecord (PascalCase basename).
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - Every `cmp reg, imm` <= 0x7FFFFFFF (largest is 128).
+//   - No 2-op `imul`/`mul`; the host hash uses shl/add/sub only. The
+//     one `div` (decimal seq conversion in `_pr_write_u64_dec`) divides
+//     by the compile-time constant 10, unaffected by the imul-avoidance
+//     convention (that convention is about *multiplying* by a
+//     compile-time constant).
+//   - No `and` on r8-r15 (the one `and rax, 0xF` low-nibble mask runs on
+//     rax only).
+//   - No `neg`; no sil/dil/bl aliases (byte stores/loads route through
+//     a full 64-bit register via `mov_b`, e.g. `mov_b rax, [ptr]` /
+//     `mov_b [ptr], rax`, except the one `mov al, 0x30` / `mov [dest],
+//     dl` pair in the div-by-10 loop, copied verbatim from
+//     mount.pdxfs's `mount_record.pdx` precedent, which already proves
+//     `al`/`dl` — not sil/dil/bl — are safe).
+//   - u32 field stores use `mov_d` (paideia-as sized-store form; see
+//     `libpdx-volume`'s `pdxb_superblock.pdx` / `cp`'s `copy.pdx` for
+//     prior art), never Intel `dword ptr` syntax.
+//   - `<= 4` curried arguments on every function (`pdxping_record_build`
+//     takes 4: out_ptr, host_ptr, count, timeout_ms — `seq` is NOT a
+//     record field per the reconciled shape above, so it never needs
+//     to reach this function).
+//   - Reserved-label discipline: every branch label below is prefixed
+//     `pr_` (disjoint from `loop`/`if`/other paideia-as keywords).
+//
+// Upstream: design/networking/r100-user-tools-plan.md §5.5 (paideia-os,
+// the original `PingRecord@0.1` shape this file's `result_code`
+// vocabulary borrows); mount.pdxfs's `src/mount_record.pdx` (the
+// strlen / decimal-conversion / segmented-sys_write precedent this
+// file's `_pr_strlen` / `_pr_write_u64_dec` /
+// `pdxping_record_dry_run_preview` are adapted from).
+
+module PingRecord = structure {
+
+  // --- Wire-shape layout constants (documentation; see file header for
+  //     the byte-count reconciliation). ------------------------------
+  pub let PR_BYTES              : u64 = 128
+  pub let PR_OFF_VERSION        : u64 = 0    // u32
+  pub let PR_OFF_OP             : u64 = 4    // u32
+  pub let PR_OFF_HOST_HASH_LO   : u64 = 8    // u64
+  pub let PR_OFF_HOST_HASH_HI   : u64 = 16   // u64
+  pub let PR_OFF_COUNT          : u64 = 24   // u64
+  pub let PR_OFF_TIMEOUT_MS     : u64 = 32   // u64
+  pub let PR_OFF_RESERVED       : u64 = 40   // [u64; 11] = 88 bytes
+  pub let PR_RESERVED_WORDS     : u64 = 11   // see file header reconciliation
+
+  pub let PR_VERSION            : u64 = 1
+  pub let PR_OP_ECHO            : u64 = 1
+
+  // --- result_code vocabulary (design doc §5.5's PingRecord@0.1 enum;
+  //     used by src/audit_wire.pdx and src/entry.pdx, not stored inside
+  //     the 128-byte wire record itself — the issue's own literal shape
+  //     has no result_code field). -------------------------------------
+  pub let PR_RESULT_OK             : u64 = 0
+  pub let PR_RESULT_TIMEOUT        : u64 = 1
+  pub let PR_RESULT_UNREACHABLE    : u64 = 2
+  pub let PR_RESULT_NO_PERMISSION  : u64 = 3
+  pub let PR_RESULT_DRY_RUN        : u64 = 4
+
+  // --- Hex-digit lookup table (no trailing NUL — indexed 0..15 only,
+  //     not treated as a C string). ------------------------------------
+  pub let PR_HEX_TABLE : [u8; 16] = "0123456789abcdef"
+
+  // --- .bss scratch: 256-byte hex-preview staging area (2 ASCII chars
+  //     per record byte) + the 128-byte record itself lives in
+  //     src/entry.pdx's own .bss (ep_record_buf), passed in by pointer.
+  pub let mut pr_hex_scratch : [u8; 256] = uninit @align(8)
+
+  // --- Literal chunks of the dry-run preview line. Lengths are exact
+  //     byte counts, not counting the trailing NUL the storage array
+  //     happens to add (same convention as mount.pdxfs's mr_lit_*).
+  pub let pr_lit_prefix     : [u8; 28] = "PingRecord@0.1 dry-run seq=\0"
+  pub let pr_lit_prefix_len : u64 = 27
+
+  pub let pr_lit_host       : [u8; 7] = " host=\0"
+  pub let pr_lit_host_len   : u64 = 6
+
+  pub let pr_lit_bytes      : [u8; 8] = " bytes=\0"
+  pub let pr_lit_bytes_len  : u64 = 7
+
+  pub let pr_lit_newline     : [u8; 2] = "\n\0"
+  pub let pr_lit_newline_len : u64 = 1
+
+  // ============================================================================
+  // _pr_hash_host(host_ptr) -> (lo in rax, hi in rdx)
+  //
+  // WEAK, non-cryptographic placeholder hash — see file header. Walks
+  // the NUL-terminated host string once, updating two djb2-family
+  // accumulators (seed 5381 multiply-by-33 for lo, seed 1000003
+  // multiply-by-31 for hi). Pure leaf: every register touched (rax,
+  // rdx, r8, r9, r10, r11, rdi) is SysV caller-save; no push/pop.
+  // ============================================================================
+  pub let _pr_hash_host : (u64) -> u64 !{mem} @{} =
+    fn (host_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxping.M1-003 (#3) _pr_hash_host. Byte-loop over host_ptr[0..NUL). r9 = lo accumulator (seed 5381), r10 = hi accumulator (seed 1000003), r8 = read cursor (starts at host_ptr). Per byte: load via xor rax,rax; mov_b rax,[r8] (#1248); lo = (lo<<5)+lo+byte via r11 scratch (avoids imul); hi = (hi<<5)-hi+byte via r11 scratch (avoids imul; `sub` is not the banned `neg` mnemonic). NUL byte (rax==0) exits the loop. Return: rax=lo, rdx=hi. No push/pop (every touched register — rax, rdx, r8, r9, r10, r11, rdi — is SysV caller-save). No test mnemonic (cmp reg,0 throughout); every cmp immediate is 0 (well within imm32). Labels prefixed pr_hash_.",
+      block: {
+        mov r9, 5381;
+        mov r10, 1000003;
+        mov r8, rdi;
+
+      pr_hash_loop:
+        xor rax, rax;
+        mov_b rax, [r8];
+        cmp rax, 0;
+        je pr_hash_done;
+
+        // lo = (lo << 5) + lo + byte
+        mov r11, r9;
+        shl r11, 5;
+        add r11, r9;
+        add r11, rax;
+        mov r9, r11;
+
+        // hi = (hi << 5) - hi + byte
+        mov r11, r10;
+        shl r11, 5;
+        sub r11, r10;
+        add r11, rax;
+        mov r10, r11;
+
+        add r8, 1;
+        jmp pr_hash_loop;
+
+      pr_hash_done:
+        mov rax, r9;
+        mov rdx, r10;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // pdxping_record_build(out_ptr, host_ptr, count, timeout_ms) -> ()
+  //
+  // Zeroes out_ptr[0..128), then stamps version/op (u32 each),
+  // host_hash_lo/hi (via _pr_hash_host), count, timeout_ms. `reserved`
+  // stays zeroed (the leading zero-fill loop already covers it).
+  //
+  // Register plan: 3-push prologue (rbx=out_ptr, r12=count,
+  // r13=timeout_ms) — entry rsp%16==8 (post-CALL SysV), 3 pushes (24
+  // bytes) lands rsp%16==0 for the one nested call (_pr_hash_host).
+  // host_ptr (rsi) is passed straight through to that call without
+  // needing its own callee-save slot (dead immediately after).
+  // ============================================================================
+  pub let pdxping_record_build : (u64, u64, u64, u64) -> () !{mem} @{} =
+    fn (out_ptr: u64) (host_ptr: u64) (count: u64) (timeout_ms: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxping.M1-003 (#3) pdxping_record_build. 3-push prologue (rbx=out_ptr, r12=count, r13=timeout_ms) lands rsp%16==0 (entry 8, 3 pushes = 24 bytes) for the nested call _pr_hash_host(host_ptr) (rsi, untouched, passed straight through in rdi). Phase 1: zero all 128 bytes via an 8-byte-stride loop (rcx 0..128 step 8, `mov [rbx+rcx], rax` with rax=0) — covers `reserved` (PR_OFF_RESERVED=40, PR_RESERVED_WORDS=11) with no separate step. Phase 2: mov_d [rbx+0], 1 (PR_VERSION) and mov_d [rbx+4], 1 (PR_OP_ECHO) — sized 32-bit stores per paideia-as's mov_d form (see libpdx-volume/pdxb_superblock.pdx / cp/copy.pdx prior art), never Intel `dword ptr`. Phase 3: mov rdi,rsi (rsi still holds the entry host_ptr argument untouched through phases 1-2, which only ever read/write rax/rcx) then call _pr_hash_host(host_ptr) -> rax=lo, rdx=hi; store [rbx+8]=rax (PR_OFF_HOST_HASH_LO), [rbx+16]=rdx (PR_OFF_HOST_HASH_HI). Phase 4: [rbx+24]=r12 (PR_OFF_COUNT), [rbx+32]=r13 (PR_OFF_TIMEOUT_MS). Pop r13/r12/rbx (reverse order), ret. No test mnemonic (zero-loop bound check is cmp rcx,128); every cmp immediate <= 128 (imm32-safe). No `and` anywhere in this function. Labels prefixed pr_build_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                       // rbx = out_ptr
+        mov r12, rdx;                       // r12 = count
+        mov r13, rcx;                       // r13 = timeout_ms
+
+        // ---- Phase 1: zero all 128 bytes (covers `reserved` too). --------
+        xor rax, rax;
+        xor rcx, rcx;
+
+      pr_build_zero_loop:
+        cmp rcx, 128;
+        jge pr_build_zero_done;
+        mov [rbx + rcx], rax;
+        add rcx, 8;
+        jmp pr_build_zero_loop;
+
+      pr_build_zero_done:
+        // ---- Phase 2: version + op (u32 each). ----------------------------
+        mov rax, 1;                         // PR_VERSION
+        mov_d [rbx + 0], rax;               // PR_OFF_VERSION
+        mov rax, 1;                         // PR_OP_ECHO
+        mov_d [rbx + 4], rax;               // PR_OFF_OP
+
+        // ---- Phase 3: host hash (WEAK placeholder; see file header). -----
+        mov rdi, rsi;                       // rdi = host_ptr (entry arg, untouched since rdi/rsi were staged)
+        call _pr_hash_host;
+        mov [rbx + 8], rax;                 // PR_OFF_HOST_HASH_LO
+        mov [rbx + 16], rdx;                // PR_OFF_HOST_HASH_HI
+
+        // ---- Phase 4: count + timeout_ms. ---------------------------------
+        mov [rbx + 24], r12;                // PR_OFF_COUNT
+        mov [rbx + 32], r13;                // PR_OFF_TIMEOUT_MS
+
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // _pr_strlen(s) -> u64
+  //
+  // Byte-loop strlen, identical shape to mount.pdxfs's own
+  // mount_record_strlen. Pure leaf: rax/rcx/rdi are SysV caller-save.
+  // ============================================================================
+  pub let _pr_strlen : (u64) -> u64 !{mem} @{} =
+    fn (s: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxping.M1-003 (#3) _pr_strlen. s in rdi. Loop: xor+mov_b loads *s into rcx (zero-extended); cmp rcx,0; je pr_strlen_done on NUL; else add rax,1 (counter) and add rdi,1 (cursor), loop. Pure leaf -- rax/rcx/rdi all SysV caller-save, no push/pop. No `add reg,[mem]`, no test mnemonic. Labels prefixed pr_strlen_.",
+      block: {
+        xor rax, rax;
+
+      pr_strlen_loop:
+        xor rcx, rcx;
+        mov_b rcx, [rdi];
+        cmp rcx, 0;
+        je pr_strlen_done;
+        add rax, 1;
+        add rdi, 1;
+        jmp pr_strlen_loop;
+
+      pr_strlen_done:
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // _pr_write_u64_dec(fd, val) -> ()
+  //
+  // Decimal-ASCII sys_write of `val` to `fd`. Div-by-10 loop copied
+  // (algorithm-identical) from mount.pdxfs's mount_record_emit_dry_run
+  // segment 6. No push/pop needed: every register touched (rax, rcx,
+  // rdx, r9, r10, rdi, rsi) is SysV caller-save; the `sub rsp,24` /
+  // `add rsp,24` bracket is stack-neutral by the time this function
+  // returns, so it imposes no alignment obligation on its own caller
+  // (only a `syscall`, never a nested `call`, executes while the
+  // bracket is open).
+  // ============================================================================
+  pub let _pr_write_u64_dec : (u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (fd: u64) (val: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "pdxping.M1-003 (#3) _pr_write_u64_dec. Algorithm copied from mount.pdxfs's mount_record_emit_dry_run segment 6 (itself adapted from mkfs.pdxfs/src/user/init.pdx's print_u64_dec). sub rsp,24 opens a 24-byte scratch (20 digit bytes + 4 slop). val==0 special case: mov al,0x30; mov [rsp],al; one-byte sys_write. Otherwise: r9=remaining value, r10=cursor at rsp+19 walking downward (MSB-last digit-store order needs no separate reversal pass). Per digit: mov rax,r9; mov rcx,10; xor rdx,rdx (zero-extend for div); div rcx (rax=quotient, rdx=remainder); add rdx,0x30 (ASCII); mov [r10],dl (byte store via the `dl` alias -- proven safe by this exact precedent, distinct from the banned sil/dil/bl); r9=quotient; loop while r9!=0, else cursor-- . Emit: length = (rsp+20) - r10, one sys_write(fd, r10, length). add rsp,24 restores. No push/pop (all touched registers -- rax,rcx,rdx,r9,r10,rdi,rsi -- are SysV caller-save). No test mnemonic (cmp reg,0 throughout). No imul/mul -- the one `div` is by the compile-time constant 10 (this codebase's imul-avoidance convention is about multiplying by a compile-time constant, not dividing). Labels prefixed pr_dec_.",
+      block: {
+        sub rsp, 24;
+
+        cmp rsi, 0;
+        jne pr_dec_setup;
+
+        // Zero special case: single '0' digit.
+        mov al, 0x30;
+        mov [rsp], al;
+        mov rdx, 1;
+        mov rsi, rsp;
+        mov rax, 1;
+        syscall;
+        jmp pr_dec_done;
+
+      pr_dec_setup:
+        mov r9, rsi;                        // r9 = remaining value
+        mov r10, rsp;
+        add r10, 19;                        // r10 = cursor at last staging byte
+
+      pr_dec_loop:
+        mov rax, r9;
+        mov rcx, 10;
+        xor rdx, rdx;                       // zero-extend rdx:rax for div
+        div rcx;                            // rax = quotient, rdx = remainder
+        add rdx, 0x30;                      // digit -> ASCII '0'..'9'
+        mov [r10], dl;                      // store at cursor
+        mov r9, rax;                        // r9 = quotient
+        cmp r9, 0;
+        je pr_dec_emit;
+        sub r10, 1;                         // advance cursor left (MSB-ward)
+        jmp pr_dec_loop;
+
+      pr_dec_emit:
+        // r10 points at the first (MSB) digit. Length = (rsp+20) - r10.
+        mov rax, rsp;
+        add rax, 20;
+        sub rax, r10;                       // rax = digit count
+        mov rdx, rax;
+        mov rsi, r10;
+        // fd (rdi) already holds the caller's argument, untouched above.
+        mov rax, 1;
+        syscall;
+
+      pr_dec_done:
+        add rsp, 24;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // pdxping_record_hexdump(record_ptr) -> ()
+  //
+  // Fills the 256-byte pr_hex_scratch with the lowercase-hex ASCII
+  // rendering of record_ptr[0..128) (two chars per byte, high nibble
+  // first). Pure leaf: every register touched (rax, rcx, rdx, r8, r9,
+  // r10, r11, rdi) is SysV caller-save; no push/pop.
+  // ============================================================================
+  pub let pdxping_record_hexdump : (u64) -> () !{mem} @{} =
+    fn (record_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxping.M1-003 (#3) pdxping_record_hexdump. r8 = &PR_HEX_TABLE, r11 = &pr_hex_scratch (both rip-relative lea, computed once), rcx = byte index 0..128. Per byte: lea r9,[rdi+rcx*1]; xor rax,rax; mov_b rax,[r9] loads the record byte (#1248). r10 = saved byte value. High nibble: mov rax,r10; shr rax,4; lea r9,[r8+rax*1]; xor rax,rax; mov_b rax,[r9] looks up the hex char; rdx=rcx*2 (shl rdx,1, out index); lea r9,[r11+rdx*1]; mov_b [r9],rax stores it. Low nibble: mov rax,r10; and rax,0xF (rax only -- never r8-r15 -- so the `and reg,imm64` encoder gap does not apply); same lookup+store sequence at out index rcx*2+1. add rcx,1; loop while rcx<128. Pure leaf -- rax,rcx,rdx,r8,r9,r10,r11,rdi are all SysV caller-save, no push/pop. No test mnemonic (cmp reg,imm throughout, largest imm=128). No 2-op imul (shl/shr/add only). No sil/dil/bl (every byte load/store routes through a full 64-bit register via mov_b, e.g. mov_b rax,[ptr] / mov_b [ptr],rax). Labels prefixed pr_hd_.",
+      block: {
+        lea r8, [rip + PR_HEX_TABLE];
+        lea r11, [rip + pr_hex_scratch];
+        xor rcx, rcx;
+
+      pr_hd_loop:
+        cmp rcx, 128;
+        jge pr_hd_done;
+
+        lea r9, [rdi + rcx*1];
+        xor rax, rax;
+        mov_b rax, [r9];                    // rax = record byte value (0..255)
+        mov r10, rax;                       // r10 = saved byte value
+
+        // ---- high nibble ---------------------------------------------------
+        mov rax, r10;
+        shr rax, 4;
+        lea r9, [r8 + rax*1];
+        xor rax, rax;
+        mov_b rax, [r9];                    // rax = ascii hex char (high)
+        mov rdx, rcx;
+        shl rdx, 1;                         // out index = i*2
+        lea r9, [r11 + rdx*1];
+        mov_b [r9], rax;
+
+        // ---- low nibble ------------------------------------------------------
+        mov rax, r10;
+        and rax, 0xF;                       // rax only -- never r8-r15
+        lea r9, [r8 + rax*1];
+        xor rax, rax;
+        mov_b rax, [r9];                    // rax = ascii hex char (low)
+        mov rdx, rcx;
+        shl rdx, 1;
+        add rdx, 1;                         // out index = i*2 + 1
+        lea r9, [r11 + rdx*1];
+        mov_b [r9], rax;
+
+        add rcx, 1;
+        jmp pr_hd_loop;
+
+      pr_hd_done:
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // pdxping_record_dry_run_preview(record_ptr, seq, host_ptr) -> ()
+  //
+  // Writes one comment-annotated hex preview line to fd 2:
+  //   "PingRecord@0.1 dry-run seq=<seq> host=<host> bytes=<256 hex chars>\n"
+  //
+  // Register plan: 3-push prologue (rbx=record_ptr, r12=seq,
+  // r13=host_ptr) — entry rsp%16==8, 3 pushes (24 bytes) lands
+  // rsp%16==0 for the three nested calls (_pr_write_u64_dec,
+  // _pr_strlen, pdxping_record_hexdump).
+  // ============================================================================
+  pub let pdxping_record_dry_run_preview : (u64, u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (record_ptr: u64) (seq: u64) (host_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "pdxping.M1-003 (#3) pdxping_record_dry_run_preview. 3-push prologue (rbx=record_ptr, r12=seq, r13=host_ptr) lands rsp%16==0 (entry 8, 3 pushes=24 bytes) for every nested call below. Segment 1: sys_write(2, pr_lit_prefix, 27) -- 'PingRecord@0.1 dry-run seq='. Segment 2: call _pr_write_u64_dec(fd=2, val=r12) -- decimal seq. Segment 3: sys_write(2, pr_lit_host, 6) -- ' host='. Segment 4: call _pr_strlen(r13) -> rax=len; sys_write(2, r13, rax) -- the host string (rdx=rax moved before the fd/buf regs are reloaded, matching mount.pdxfs's own segment-2 idiom). Segment 5: sys_write(2, pr_lit_bytes, 7) -- ' bytes='. Segment 6: call pdxping_record_hexdump(rbx) fills pr_hex_scratch (256 bytes); sys_write(2, &pr_hex_scratch, 256). Segment 7: sys_write(2, pr_lit_newline, 1). Pop r13/r12/rbx (reverse order), ret (no value; caller sys_exits or loops itself). Never returns an error code -- every sys_write's return value is ignored, matching mount.pdxfs's own posture at this maturity. No test mnemonic; every cmp reg,imm <= 256 (imm32-safe). Labels prefixed pr_prev_ where present (this function has no internal branches -- straight-line segments only).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                       // rbx = record_ptr
+        mov r12, rsi;                       // r12 = seq
+        mov r13, rdx;                       // r13 = host_ptr
+
+        // ---- Segment 1: "PingRecord@0.1 dry-run seq=" ---------------------
+        mov rdi, 2;
+        lea rsi, [rip + pr_lit_prefix];
+        mov rdx, 27;                        // pr_lit_prefix_len
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 2: decimal seq ----------------------------------------
+        mov rdi, 2;
+        mov rsi, r12;
+        call _pr_write_u64_dec;
+
+        // ---- Segment 3: " host=" -------------------------------------------
+        mov rdi, 2;
+        lea rsi, [rip + pr_lit_host];
+        mov rdx, 6;                         // pr_lit_host_len
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 4: host string -----------------------------------------
+        mov rdi, r13;
+        call _pr_strlen;
+        mov rdx, rax;                       // rdx = host len
+        mov rdi, 2;
+        mov rsi, r13;
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 5: " bytes=" ---------------------------------------------
+        mov rdi, 2;
+        lea rsi, [rip + pr_lit_bytes];
+        mov rdx, 7;                         // pr_lit_bytes_len
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 6: hex preview (256 bytes) --------------------------------
+        mov rdi, rbx;
+        call pdxping_record_hexdump;
+        mov rdi, 2;
+        lea rsi, [rip + pr_hex_scratch];
+        mov rdx, 256;
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 7: newline -------------------------------------------------
+        mov rdi, 2;
+        lea rsi, [rip + pr_lit_newline];
+        mov rdx, 1;                         // pr_lit_newline_len
+        mov rax, 1;
+        syscall;
+
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+}

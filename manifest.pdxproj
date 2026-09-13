@@ -1,0 +1,76 @@
+# pdxping -- paideia-as build manifest
+#
+# Wave: R100  Milestone: M1-001/M1-002/M1-003/M3-001/M3-002 (Wave AA cohort)
+# Doc:  design/networking/r100-user-tools-plan.md §5 + §13 (paideia-os repo).
+#
+# Consumed by `paideia-as build` (release-time signer path) and by the
+# tools/build.sh iterator (`src/*.pdx` glob) at day-to-day build time.
+
+name        = pdxping
+version     = 1.0.0
+kind        = tool
+entry       = _start                    # src/entry.pdx
+output      = build-out/pdxping.elf
+caps_decl   = caps.decl
+
+# --- Source list (order-insensitive; paideia-as resolves module deps
+# from `module <Basename> = structure { ... }` headers). ---------------
+sources:
+  - src/entry.pdx                 # M1-001/M1-002/M1-003/M3-001/M3-002: _start, wires every module below
+  - src/argv_parse.pdx            # M1-002 (#2): --count/--interval-ms/--timeout-ms/--dry-run/<host>
+  - src/ping_record.pdx           # M1-003 (#3): PingRecord@0.1 128B wire shape + dry-run hex preview
+  - src/elevate_gate.pdx          # M3-001 (#6): R_NET_PRIVILEGED_PROTOCOL elevate gate (WEAK, fail-closed)
+  - src/audit_wire.pdx            # M3-002 (#7): libpdx-audit per-echo record (WEAK stub)
+
+# --- Library dependencies ----------------------------------------------
+# pdxping at v1.0.0 depends on nothing outside the SC+ syscall floor
+# (sysno 1 = sys_write, 60 = sys_exit). Neither libpdx-elevate nor
+# libpdx-audit is in `deps:` at this landing -- both integration points
+# (src/elevate_gate.pdx, src/audit_wire.pdx) are WEAK stubs with a
+# stable call-site ABI, same posture pdxsock's own M3-002 landing
+# documents for the identical libpdx-audit gap. Wiring either real
+# dependency is tracked as a follow-up: (a) add the satellite to this
+# `deps:` list; (b) extend tools/build.sh's --extra-obj-dir/--extra-
+# archive invocation; (c) narrow caps.decl's placeholder rows to
+# mandatory; (d) swap each WEAK-stub body for a real call, with no
+# caller-side (src/entry.pdx) change required.
+deps: []
+
+# --- Test targets ------------------------------------------------------
+# M4 smokes (happy dry-run, elevate-denied path) are deferred to a
+# future milestone -- not part of the Wave AA cohort (pdxping#1/#2/#3/
+# #6/#7 only).
+tests: []
+
+# --- Documentation targets ---------------------------------------------
+docs:
+  - doc/pdxping.pdxdoc            # source form, `pdxdoc-source v0.1`
+
+# --- Paideia-as compliance flags ---------------------------------------
+compliance:
+  - module-basename-pascal        # Module <BasenamePascalCase>, no dir prefix
+  - no-test-mnemonic              # zero-check via cmp reg, 0
+  - cmp-imm32-only                # cmp reg, imm <= 0x7FFFFFFF; else stage via r11/r10
+  - r11-scratch                   # r11 is not preserved across calls
+  - byte-load-zero-then-mov_b     # xor rax, rax; mov_b rax, [ptr]
+  - sysv-push-pop-parity          # rsp % 16 == 0 at every nested call
+  - curried-args-max-4            # marshal >4 logical arguments via a scratch-struct pointer instead
+
+# --- Release policy ----------------------------------------------------
+# v1.0.0 is the Wave AA cohort landing (pdxping#1/#2/#3/#6/#7). The
+# source form of the manifest lives at the repo root, `manifest.pdxsig`
+# (paideia-manifest-pdxsig@1 schema, hybrid-ed25519+ml-dsa-65 signature
+# scheme), with every hash and every signature slot a documented
+# placeholder the release tool fills in at tag time. The dual-sign
+# pass itself is NOT performed at this landing -- release-line seed
+# keys are hardware-backed / KMS-custody per paideia-os design/02-
+# development-environment.md §1164 and never repo-resident.
+release:
+  signer_author  = paideia-release-line  # placeholder-until-sign; see
+                                          # manifest.pdxsig [signatures]
+                                          # block for the SIGNATURE_
+                                          # PLACEHOLDER_PENDING_LIVE_SIGN
+                                          # sentinel the dual-sign pass
+                                          # replaces.
+  mirror_target  = pkgs.paideia-os/main/pdxping/1.0.0/   # future mirror push
+  manifest_src   = manifest.pdxsig                       # source form of manifest.pdxsig

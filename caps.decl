@@ -1,0 +1,70 @@
+# pdxping -- caps.decl
+#
+# Format: R90-XREPO.013.M1-001 line-oriented caps.decl grammar
+# (paideia-os design/architecture/caps-decl-format.md). `!KIND_FOO
+# <mask>` = mandatory: exec fails -EACCES if the parent's cap-set does
+# not hold at least this mask. ` KIND_FOO <mask>` (no `!`) = optional:
+# narrowed to at most this mask, dropped to zero if the parent held
+# none.
+#
+# pdxping's role: minimal ICMP echo CLI, first exerciser of the
+# R_NET_PRIVILEGED_PROTOCOL elevate class (paideia-os
+# design/networking/r100-user-tools-plan.md §5). Wave AA (pdxping#1,
+# M1-001 scaffold): this decl declares the exec-time cap surface for
+# the M1 scaffold + M3 elevate-gate wiring landed in this cohort.
+# M2 (real sys_icmp_echo, sysno 103) is OUT OF SCOPE for this cohort
+# (pdxping#4/#5, not yet opened) -- see README.md and CHANGELOG.md.
+#
+# Kind rationale:
+#   KIND_USER              -- invoker attribution (audit-record
+#                              identity + AuditWire::pdxping_audit_
+#                              echo's actor field, once the WEAK stub
+#                              in src/audit_wire.pdx is swapped for a
+#                              real libpdx-audit call). Mandatory: a
+#                              tool whose entire purpose is a
+#                              privileged-protocol probe should not run
+#                              anonymously.
+#
+#   KIND_ELEVATE_CHANNEL    -- PLACEHOLDER ONLY at this landing, same
+#                              posture rm/mount.pdxfs/umount.pdxfs
+#                              document for their own KIND_ELEVATE_
+#                              CHANNEL rows (0x191). src/elevate_gate.pdx's
+#                              ElevateGate::elevate_check_and_require is
+#                              a WEAK, always-DENY, fail-closed stub: no
+#                              code path in this landing holds or
+#                              invokes a real broker-endpoint cap (no
+#                              `mint_ctx_buf.parent_ep_slot` value this
+#                              repo could honestly populate -- see that
+#                              file's own header for the full
+#                              precedent chain). Declared here anyway
+#                              per this cohort's own M1-001 scope note
+#                              so the day a real elevate-broker cap is
+#                              provisioned to this tool, only this
+#                              row's `!`-mandatory flip (and elevate_
+#                              gate.pdx's body) need to change -- no
+#                              caps.decl restructuring. Optional (no
+#                              `!`) because the WEAK stub never
+#                              actually dereferences a held cap.
+#
+#   KIND_IPC_ENDPOINT       -- optional; reserved for the future
+#                              semantic-pipe PingRecord@0.1 emission
+#                              path (design doc §5.5) and for
+#                              AuditWire's real libpdx-audit swap
+#                              (audit_file_append, once linkable --
+#                              see src/audit_wire.pdx). Neither call
+#                              site is real at this landing (both are
+#                              WEAK stubs), so this row is
+#                              documentation-only, matching pdxsock's
+#                              own KIND_IPC_ENDPOINT precedent.
+
+!KIND_USER              0x001   # invoker attribution (audit identity)
+ KIND_ELEVATE_CHANNEL   0x191   # placeholder only -- elevate_gate.pdx WEAK-stubs DENY, never dereferences a held cap
+ KIND_IPC_ENDPOINT      0x001   # placeholder only -- semantic-pipe + audit-journal swap, both WEAK stubs at this landing
+
+# Declared output schemas -- the semantic-pipe schema this tool will
+# emit once the schema registry (paideia-os#2000) and a real
+# KIND_IPC_ENDPOINT bind land. Not emitted over the wire at this
+# landing (--dry-run previews PingRecord@0.1's bytes directly to fd 2
+# instead, per src/ping_record.pdx).
+declares_output_schemas:
+  - PingRecord@0.1

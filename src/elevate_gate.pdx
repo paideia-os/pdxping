@@ -1,0 +1,111 @@
+// src/elevate_gate.pdx — pdxping.M3-001 (#6): R_NET_PRIVILEGED_PROTOCOL
+// elevate gate (WEAK, fail-closed).
+//
+// Scope
+// -----
+// This module implements pdxping#6 (M3-001): "R_NET_PRIVILEGED_PROTOCOL
+// elevate request (fail-closed per §5.4)." Before any real ICMP send
+// (M2-001 is out of scope for this cohort -- see CHANGELOG.md), a
+// non-`--dry-run` invocation of pdxping calls
+// `pdxping_elevate_check_and_require` exactly once. On denial (the
+// only reachable outcome at this landing), `src/entry.pdx` writes
+// `[pdxping.M3-001 EACCES]` to fd 2 and exits 13.
+//
+// Why this is a WEAK stub, and why that is the CORRECT answer today
+// -------------------------------------------------------------------
+// The task brief for this issue asks for
+// `elevate_client_acquire` -> `elevate_client_require` against the
+// `R_NET_PRIVILEGED_PROTOCOL` right (mirrors `rm`'s own LE-001 (#29)
+// acquire/require composition against `KIND_ELEVATE_CHANNEL`, and
+// `mount.pdxfs`'s / `umount.pdxfs`'s own `KIND_ELEVATE_CHANNEL`
+// fail-closed stubs). A full read of `libpdx-elevate`'s real API
+// (`ElevateClientAcquire::elevate_client_acquire(caps, dur, req_buf,
+// reply_ep_id, reply_buf, mint_ctx_buf) -> row_id | error`) finds the
+// same prerequisite every one of those sibling repos' own module
+// headers documents: the caller must already hold a `KIND_IPC_ENDPOINT`
+// cap over `svc.elevate-broker` at `mint_ctx_buf.parent_ep_slot`. This
+// repo's `caps.decl` declares `KIND_ELEVATE_CHANNEL` as a PLACEHOLDER
+// ONLY (see that file's own comment) -- no code path in this landing
+// holds or invokes a real broker-endpoint cap, so there is no honest
+// `mint_ctx_buf.parent_ep_slot` value this repo could populate. Rather
+// than fabricate a plausible-looking `elevate_client_acquire` call
+// against a field this repo cannot honestly fill in (the exact trap
+// `mount.pdxfs`'s `mount_elev_require_system` and `rm`'s own module
+// headers document avoiding), `pdxping_elevate_check_and_require`
+// below always returns `EG_DENY`. This is the honest, fail-closed
+// answer to "can this process prove it holds elevation over
+// R_NET_PRIVILEGED_PROTOCOL": since no real elevation request can be
+// constructed at all, "cannot prove GRANT" and "DENY" are the same
+// externally observable outcome.
+//
+// This is ALSO not merely a repo-local gap papered over by a
+// convenient stub: the kernel-side gate backing this exact right
+// (`cap_check_r_net_privileged_protocol`,
+// `src/kernel/core/cap/cap_net_privileged.pdx`, R100-PREP-003
+// paideia-os#2009) is documented, AT HEAD, to permit only the
+// boot-witness (`task_ptr == 0`) or `pid == 1` (init) -- i.e. even a
+// hypothetical real `elevate_client_acquire`/`_require` round-trip from
+// an ordinary ring-3 `pdxping` process would be refused `-EPERM`
+// kernel-side today, independent of whether a broker-endpoint cap were
+// ever provisioned to this tool. `EG_DENY` here is therefore not a
+// pessimistic guess about an unknowable future state -- it matches the
+// live kernel policy exactly. `EG_GRANT` is kept as a real, reachable
+// return value (not deleted) so the day BOTH (a) a broker-endpoint cap
+// is provisioned to this tool and (b) the kernel gate above is opened
+// to ordinary ring-3 callers, only this file's body needs to change
+// to a real `elevate_client_acquire` + `elevate_client_require`
+// sequence -- `src/entry.pdx`'s call site does not change.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module ElevateGate (PascalCase basename).
+//   - Zero-argument function; trivially within the <= 4 curried-args
+//     cap.
+//   - No test mnemonic, no cmp at all in the WEAK-stub body (nothing
+//     to branch on).
+//   - Leaf; no push/pop (writes only rax).
+//
+// Upstream: design/networking/r100-user-tools-plan.md §5.4 (paideia-os,
+// the R_NET_PRIVILEGED_PROTOCOL elevate-class recommendation this
+// issue implements); src/kernel/core/cap/cap_net_privileged.pdx
+// (paideia-os, R100-PREP-003 #2009 -- the live kernel-side gate this
+// stub's fail-closed posture matches); rm's src/elevate.pdx (LE-001,
+// rm#29 -- the acquire/require composition pattern this file names but
+// does not yet invoke); mount.pdxfs's src/elevate.pdx
+// (`mount_elev_require_system` -- the identical "declared cap,
+// unprovisioned broker, always-DENY" precedent this file's posture is
+// adapted from).
+
+module ElevateGate = structure {
+
+  // --- Return codes. ------------------------------------------------------
+  pub let EG_DENY  : u64 = 0
+  pub let EG_GRANT : u64 = 1
+
+  // --- Documentation-only mirror of the kernel-side right constant
+  //     (src/kernel/core/cap/cap_net_privileged.pdx's
+  //     R_NET_PRIVILEGED_PROTOCOL = 0x1000). Not consumed by the
+  //     WEAK-stub body below -- kept so `grep R_NET_PRIVILEGED_PROTOCOL`
+  //     across both repos surfaces this call site. -----------------------
+  pub let R_NET_PRIVILEGED_PROTOCOL : u64 = 0x1000
+
+  // ============================================================================
+  // pdxping_elevate_check_and_require() -> u64
+  //
+  //   rax = EG_DENY (0) -- the only reachable value at this landing.
+  //         EG_GRANT (1) is a real, wired return value with no live
+  //         code path that produces it (see file header).
+  //
+  // Zero-argument WEAK stub. Called once by src/entry.pdx before any
+  // non---dry-run echo attempt.
+  // ============================================================================
+  pub let pdxping_elevate_check_and_require : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxping.M3-001 (#6) pdxping_elevate_check_and_require. WEAK, fail-closed stub -- see file header for the full precedent chain (rm LE-001 #29, mount.pdxfs mount_elev_require_system, umount.pdxfs elevate_request_system_unmount) and for why EG_DENY matches the live kernel-side cap_check_r_net_privileged_protocol gate (R100-PREP-003, paideia-os#2009) exactly rather than merely guessing pessimistically. Body: xor rax,rax; ret -- sets EG_DENY (0), touches no memory despite the declared !{mem} effect (the wider declaration matches what a real elevate_client_acquire/_require pair would require, per this codebase's convention of declaring the FUTURE real body's effect/capability set so the swap-to-real landing changes only body bytes, not the pub-let signature -- see pdxsock's own AuditWire module header for the identical convention applied to a sibling WEAK stub). Zero-argument function; leaf; no push/pop; writes only rax. No test mnemonic (no branch in this body at all). Labels: none (straight-line body).",
+      block: {
+        xor rax, rax;
+        ret;
+      }
+    }
+}

@@ -1,0 +1,133 @@
+# pdxping v1.0.0 — release manifest (source form)
+#
+# This is the human-readable SOURCE FORM of `manifest.pdxsig`, unsigned,
+# per pdxping#1 (M1-001 scaffold). The release tool at pkgs.paideia-os
+# mirror-push time (a) enumerates the artifact list below, (b)
+# recomputes every BLAKE3-256 hash from the repo tree at the v1.0.0
+# tag, (c) writes the completed manifest into a binary `manifest.pdxsig`,
+# and (d) invokes
+#   paideia-pq-sign::sign_release_artifact(sk, manifest_path)
+# once with the paideia-release-line Ed25519 secret key and once with
+# the ML-DSA-65 secret key. The two detached signatures are appended to
+# the manifest in the fixed layout below and the resulting
+# `manifest.pdxsig` is pushed to
+#   https://pkgs.paideia-os/main/pdxping/1.0.0/manifest.pdxsig
+# alongside the compiled artifacts.
+#
+# Format mirrors `umount.pdxfs`'s and `pdxsock`'s own
+# `release/manifest.pdxsig.txt` byte-for-byte in structure. Every
+# `<BLAKE3-*>` / `<...-KID-*>` / `<...-SIG-*>` slot below is a
+# placeholder the release tool fills in from the working tree at tag
+# time; NONE are computed at this milestone.
+#
+# Reference:
+#   design/paideia-as/v0.20-issue-1025-pq-signing.md — Hybrid,
+#     sign_release_artifact, HybridSignature (Ed25519 || ML-DSA-65).
+#   design/02-development-environment.md §1140 — hybrid release-
+#     artifact signature rationale (Ed25519 + ML-DSA-65).
+#   design/networking/r100-user-tools-plan.md §1 — repo shape every
+#     R100 satellite reuses verbatim (this file included).
+
+format-version:      1
+manifest-schema:     paideia-manifest-pdxsig@1
+package-name:        pdxping
+package-version:     1.0.0
+package-release:     R100-WaveAA-M1M3            # Wave AA cohort: M1-001/M1-002/M1-003/M3-001/M3-002
+package-license:     MIT
+source-repo:         https://github.com/paideia-os/pdxping
+source-commit:       <TAG-v1.0.0-COMMIT-SHA>     # release tool fills in
+source-tag:          v1.0.0
+
+# ---------------------------------------------------------------
+# Artifact set — every file the compiled package ships. The hash
+# discipline is BLAKE3-256, upper 32 bytes rendered as 64 hex chars.
+# The release tool recomputes each hash from the working tree at the
+# v1.0.0 tag before writing the binary manifest. The order below is
+# stable (lexicographic within each section) so the concatenated
+# hash-input is reproducible across signers.
+# ---------------------------------------------------------------
+
+[artifacts.source]
+caps.decl                          blake3-256 = <BLAKE3-caps.decl>
+src/argv_parse.pdx                 blake3-256 = <BLAKE3-argv_parse.pdx>
+src/audit_wire.pdx                 blake3-256 = <BLAKE3-audit_wire.pdx>
+src/elevate_gate.pdx               blake3-256 = <BLAKE3-elevate_gate.pdx>
+src/entry.pdx                      blake3-256 = <BLAKE3-entry.pdx>
+src/ping_record.pdx                blake3-256 = <BLAKE3-ping_record.pdx>
+
+[artifacts.doc]
+doc/pdxping.pdxdoc                 blake3-256 = <BLAKE3-pdxping.pdxdoc>
+
+[artifacts.legal]
+LICENSE                            blake3-256 = <BLAKE3-LICENSE>
+README.md                          blake3-256 = <BLAKE3-README.md>
+CHANGELOG.md                       blake3-256 = <BLAKE3-CHANGELOG.md>
+
+# ---------------------------------------------------------------
+# Cross-repo dependencies. Empty at v1.0.0 — see CHANGELOG.md "Known
+# deferred substrate" for why libpdx-elevate/libpdx-audit are named
+# only in source comments, not as real link-time dependencies.
+# ---------------------------------------------------------------
+
+[depends-on]
+libpdx-elevate      (linked at the header level only; every call site
+                     is a fail-closed WEAK stub at this release — see
+                     src/elevate_gate.pdx)
+libpdx-audit        (linked at the header level only; every call site
+                     is a WEAK stub returning AUDIT_OK at this release
+                     — see src/audit_wire.pdx)
+
+# ---------------------------------------------------------------
+# Substrate contracts — what MUST be present in the runtime for the
+# compiled artifact to link and execute correctly.
+# ---------------------------------------------------------------
+
+[substrate]
+paideia-as-toolchain    >= 0.36.0
+kernel-cap-kind         = KIND_USER (0x190)
+kernel-cap-kind         = KIND_ELEVATE_CHANNEL (0x191)     # placeholder
+                          only -- no code path in this release actually
+                          holds or invokes a KIND_ELEVATE_CHANNEL cap
+kernel-syscall          = sys_icmp_echo (sysno 103) -- landed
+                          (R100-PREP-003, paideia-os#2009), gated by
+                          cap_check_r_net_privileged_protocol, which
+                          at HEAD permits only the boot-witness/init
+                          context. NOT CALLED by this release (M2 is
+                          out of scope for the Wave AA cohort).
+
+# ---------------------------------------------------------------
+# Signature block — dual-signed per design/02-development-environment.md
+# §1140 (hybrid Ed25519 + ML-DSA-65). Both signatures cover the SAME
+# canonical byte-stream: the manifest body above (everything before
+# the [signatures] marker line) hashed with BLAKE3-256 and signed via
+# paideia-pq-sign::sign_release_artifact. Verification is AND-semantics:
+# both signatures MUST verify; failure of either rejects the package.
+#
+# NOT PERFORMED AT THIS MILESTONE. This repo holds no live release-line
+# seed key — signing seed material is release-line custody, never
+# repo-resident. The signature block below is left as the documented
+# placeholder value `SIGNATURE_PLACEHOLDER_PENDING_LIVE_SIGN` in every
+# slot the real dual-sign pass would fill.
+# ---------------------------------------------------------------
+
+[signatures]
+signer-identity      = paideia-release-line
+signer-key-source    = design/02-development-environment.md §1164
+                       (hardware-backed in CI -- TPM 2.0 on the release
+                       runner, or a cloud KMS pending PQ-KMS
+                       availability check per that section's TODO).
+signature-scheme     = hybrid-ed25519+ml-dsa-65 (paideia-pq-hybrid-v1)
+hash-input-algo      = blake3-256
+hash-input-domain    = "paideia-release-artifact\x00" || manifest-body-bytes
+
+ed25519-key-id       = SIGNATURE_PLACEHOLDER_PENDING_LIVE_SIGN
+ed25519-signature    = SIGNATURE_PLACEHOLDER_PENDING_LIVE_SIGN
+
+ml-dsa-65-key-id     = SIGNATURE_PLACEHOLDER_PENDING_LIVE_SIGN
+ml-dsa-65-signature  = SIGNATURE_PLACEHOLDER_PENDING_LIVE_SIGN
+
+# End of manifest.pdxsig source. The release tool ships a canonical
+# binary form (`.pdxsig`) alongside this source form; keeping both in
+# the repo means a downstream auditor can diff the source-form manifest
+# against the binary the mirror served, without needing to re-run the
+# hash pass on the repo tree.
