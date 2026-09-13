@@ -3,6 +3,74 @@
 All notable changes to `pdxping` are recorded here. Format: keep-a-
 changelog-style, semver-ordered, newest first.
 
+## [1.1.0] -- Wave BB follow-up (2026-09-13)
+
+Closes pdxping#4. Closes pdxping#5. Closes pdxping#8.
+
+### Added
+
+- **M2-001 (#4): real `sys_icmp_echo` call + RTT capture (WEAK stub,
+  scaffold body only).** `src/icmp_wire.pdx` (`Module IcmpWire`)
+  declares `sys_icmp_echo(ip_be, seq, timeout_ms, out_rtt_ns_ptr) ->
+  u64` (sysno 103, documented but never issued) and the convenience
+  wrapper `icmp_wire_echo_one(ip_be, seq, timeout_ms) -> u64` (echo_ok
+  in `rax`, `rtt_ns` in `rdx`). The stub discards every input and
+  always writes a fixed RTT of 1,500,000 ns (1.5ms), returning
+  `IW_ECHO_OK`. **Blocked on R100-PREP-003**: the kernel-side
+  `cap_check_r_net_privileged_protocol` gate permits only the
+  boot-witness/init context, so no ordinary ring-3 `pdxping` process
+  could reach a real echo dispatch today regardless of this file's
+  body -- and the only call site (`src/entry.pdx`'s `ep_real_grant`
+  arm) is itself unreachable while `ElevateGate::pdxping_elevate_
+  check_and_require` always returns `EG_DENY` (#6). Real, wired,
+  dead code today by construction -- same posture `elevate_gate.pdx`
+  and `audit_wire.pdx` already document.
+- **M2-002 (#5): `--count` loop + summary stats.** `src/entry.pdx`'s
+  `ep_real_grant` arm now loops `count` times calling `IcmpWire::
+  icmp_wire_echo_one`, accumulating `rtt_sum` / `rtt_min` (init
+  sentinel `0xFFFFFFFFFFFFFFFF`) / `rtt_max` / `loss_count` into a new
+  64-byte `ep_stats_buf` .bss struct, then prints "`N transmitted, M
+  received, LOSS_PCT% loss, min/avg/max = MIN/AVG/MAX ns`" to fd 1 via
+  a new `_er_emit_summary` helper. `loss_pct` is computed as
+  `(loss_count*100)/count` via two rounds of the shl3+shl1+add `*10`
+  composition (no 2-op `imul`), guarded against `--count=0` (division
+  by zero) by short-circuiting to `0% loss` / `avg=0` / `min=0` when
+  `received == 0`. This entire loop is real, wired code but shares
+  M2-001's unreachability today (see above) -- it exercises real
+  arithmetic and I/O against the WEAK-stub `icmp_wire_echo_one`, ready
+  to produce real numbers the moment both upstream blockers clear.
+- **M3-003 (#8): semantic-pipe `PingRecord@0.1` emit (WEAK stub).**
+  `src/pipe_emit.pdx` (`Module PipeEmit`) declares `pdxping_pipe_emit_
+  record(record_ptr) -> u64`, intended to call `sys_semantic_send`
+  (sysno 115, documented but never issued) once per echo ATTEMPT --
+  `src/entry.pdx`'s `--dry-run` loop now calls this once per iteration,
+  immediately after the existing `AuditWire::pdxping_audit_echo` call,
+  same cadence. Two unprovisioned resources block a real call: no real
+  `KIND_IPC_ENDPOINT` cap is bound to a schema-registry channel (this
+  repo's `caps.decl` row is a documented placeholder), and no
+  `PingRecord@0.1` `schema_id` is registered (no schema-registry
+  integration exists in this repo yet -- see the sibling `libpdx-font`
+  repo's `FontSchema::font_schema_init` for the analogous
+  register-then-hold-a-handle shape once this repo grows one). Body is
+  a no-op `xor rax, rax; ret` returning `PE_OK` (0), same WEAK-stub
+  shape `AuditWire::pdxping_audit_echo` documents for the identical
+  kind of gap.
+
+### Known deferred substrate (carried forward)
+
+- The `EG_GRANT` arm (M2-001/M2-002's real echo loop) remains
+  unreachable in practice: it requires BOTH a real elevate-broker cap
+  provisioned to this tool (`src/elevate_gate.pdx`) AND the kernel-side
+  `cap_check_r_net_privileged_protocol` gate opened to ordinary ring-3
+  callers (R100-PREP-003, paideia-os#2009). Neither has happened.
+- `sys_icmp_echo` (sysno 103) and `sys_semantic_send` (sysno 115) are
+  documented by constant/comment in `src/icmp_wire.pdx` /
+  `src/pipe_emit.pdx` but never issued as a real `syscall` instruction
+  anywhere in this repo.
+- `libpdx-elevate`, `libpdx-audit`, and a schema-registry client are
+  referenced by name in source comments but are NOT in
+  `manifest.pdxproj`'s `deps:` list.
+
 ## [1.0.0] -- Wave AA cohort (2026-09-13)
 
 Closes pdxping#1, pdxping#2, pdxping#3, pdxping#6, pdxping#7.

@@ -1,0 +1,156 @@
+// src/icmp_wire.pdx — pdxping.M2-001 (#4): real sys_icmp_echo call +
+// RTT capture (WEAK stub -- scaffold body only, blocked on
+// R100-PREP-003).
+//
+// Scope
+// -----
+// This module implements pdxping#4 (M2-001): "real sys_icmp_echo call
+// + RTT capture." It owns the syscall-shaped wrapper
+// `sys_icmp_echo(ip_be, seq, timeout_ms, out_rtt_ns_ptr) -> u64` and a
+// convenience wrapper `icmp_wire_echo_one(ip_be, seq, timeout_ms) ->
+// (echo_ok in rax, rtt_ns in rdx)` that `src/entry.pdx`'s M2-002
+// (#5) `--count` loop calls once per iteration on the non---dry-run
+// path.
+//
+// Why this is a WEAK stub, and why that is the CORRECT answer today
+// -------------------------------------------------------------------
+// The kernel-side `sys_icmp_echo` syscall (sysno 103) landed at
+// R100-PREP-003 (paideia-os#2009), but its cap gate
+// (`cap_check_r_net_privileged_protocol`,
+// `src/kernel/core/cap/cap_net_privileged.pdx`) permits only the
+// boot-witness (`task_ptr == 0`) or `pid == 1` (init) — i.e. an
+// ordinary ring-3 `pdxping` process cannot reach a real echo dispatch
+// today regardless of what this file's body does, matching
+// `src/elevate_gate.pdx`'s own documented posture for the identical
+// gap (see that file's header for the full precedent chain). This
+// repo's `ep_real_grant` arm in `src/entry.pdx` (the only call site of
+// `icmp_wire_echo_one`) is itself unreachable at this landing, since
+// `ElevateGate::pdxping_elevate_check_and_require` always returns
+// `EG_DENY` — so this file's WEAK-stub body is, like `elevate_gate.pdx`
+// and `audit_wire.pdx` before it, dead code on every real invocation
+// today, kept real and wired so the day BOTH (a) a broker-endpoint cap
+// is provisioned to this tool and (b) the kernel gate above is opened
+// to ordinary ring-3 callers, only this file's `sys_icmp_echo` body
+// needs to change to a real `mov rax, 103; syscall;` sequence —
+// `icmp_wire_echo_one`'s call site in `src/entry.pdx` does not change.
+//
+// Rather than fabricate a real `syscall` instruction against a gate
+// this process can never honestly pass (the exact trap
+// `elevate_gate.pdx`'s own header documents avoiding for
+// `elevate_client_acquire`), `sys_icmp_echo` below is a scaffold body
+// only: it discards `ip_be`/`seq`/`timeout_ms`, writes a fixed RTT of
+// `IW_RTT_STUB_NS` (1_500_000 ns = 1.5ms) to `*out_rtt_ns_ptr`, and
+// returns `IW_ECHO_OK` (1) unconditionally. This lets M2-002's
+// (#5) `--count` loop, summary-stats accumulator, and print path all
+// be built and exercised end-to-end today against a deterministic,
+// always-succeeding echo primitive, with a single documented seam
+// (this file's body) to swap in the real syscall once both blockers
+// above clear.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module IcmpWire (PascalCase basename).
+//   - Every function <= 4 curried args (`sys_icmp_echo` is the widest,
+//     at 4; `icmp_wire_echo_one` takes 3).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - No `and` on r8-r15 anywhere in this file.
+//   - No 2-op imul; no neg; no sil/dil/bl aliases.
+//   - Reserved-label discipline: `icmp_wire_echo_one`'s one internal
+//     comment-only region has no branch labels at all (straight-line
+//     body); if a future real body needs labels they must be prefixed
+//     `iw_` (disjoint from `loop`/`if`/other paideia-as keywords).
+//
+// Upstream: design/networking/r100-user-tools-plan.md §5 (paideia-os,
+// the original M2 real-echo scope this issue implements);
+// src/kernel/core/cap/cap_net_privileged.pdx (paideia-os,
+// R100-PREP-003 #2009 — the live kernel-side gate this stub's
+// unreachability matches); src/elevate_gate.pdx, src/audit_wire.pdx
+// (this repo, the identical "declared real, WEAK-stubbed today"
+// precedent this file's posture and header structure are adapted
+// from).
+
+module IcmpWire = structure {
+
+  // --- Return codes / constants. -------------------------------------
+  pub let IW_ECHO_OK      : u64 = 1
+  pub let IW_ECHO_FAIL    : u64 = 0
+  pub let IW_RTT_STUB_NS  : u64 = 1500000  // 1.5ms -- WEAK-stub fixed RTT, see file header
+
+  // --- Documentation-only mirror of the kernel-side syscall number
+  //     (sysno 103, R100-PREP-003). Not issued by the stub body below
+  //     — kept so `grep sys_icmp_echo` across both repos surfaces this
+  //     call site. ---------------------------------------------------
+  pub let IW_SYS_ICMP_ECHO : u64 = 103
+
+  // --- .bss scratch: out_rtt_ns_ptr target for icmp_wire_echo_one's
+  //     internal call into sys_icmp_echo. -----------------------------
+  pub let mut iw_rtt_scratch : u64 = uninit @align(8)
+
+  // ============================================================================
+  // sys_icmp_echo(ip_be, seq, timeout_ms, out_rtt_ns_ptr) -> u64
+  //
+  //   rdi = ip_be           (big-endian IPv4 address; discarded by the
+  //                          stub — no DNS/IP-resolve path exists in
+  //                          this cohort, see src/entry.pdx)
+  //   rsi = seq             (echo sequence number; discarded)
+  //   rdx = timeout_ms      (discarded)
+  //   rcx = out_rtt_ns_ptr  (caller-owned u64 scratch; the stub always
+  //                          writes IW_RTT_STUB_NS here)
+  //   rax = IW_ECHO_OK (1) — the stub always succeeds.
+  //
+  // WEAK stub — see file header for the full R100-PREP-003 blocker
+  // writeup. Leaf: no push/pop; touches only rax and *out_rtt_ns_ptr.
+  // ============================================================================
+  pub let sys_icmp_echo : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (ip_be: u64) (seq: u64) (timeout_ms: u64) (out_rtt_ns_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxping.M2-001 (#4) sys_icmp_echo. WEAK stub -- see file header for the full R100-PREP-003 blocker writeup (the kernel-side cap gate, cap_check_r_net_privileged_protocol, permits only the boot-witness/init context, so no ordinary ring-3 pdxping process could reach a real echo dispatch today regardless of this body -- and the only call site, src/entry.pdx's ep_real_grant arm, is itself unreachable while ElevateGate::pdxping_elevate_check_and_require always returns EG_DENY). Body: mov rax, 1500000 (IW_RTT_STUB_NS, 1.5ms); mov [rcx], rax stores it to out_rtt_ns_ptr (rcx, the 4th SysV integer arg); mov rax, 1 (IW_ECHO_OK); ret. ip_be/seq/timeout_ms (rdi/rsi/rdx) are all caller-save and freely discarded. effects: {mem} declared for the one store to *out_rtt_ns_ptr; capabilities: {} since the stub issues no syscall (a real body would additionally need sysreg for its `syscall` instruction and whatever capability class future-gates a live sys_icmp_echo dispatch -- left undeclared here rather than guessed, since inventing an unconfirmed capability tag risks a worse error than an honest under-declaration at swap-to-real time). Leaf; no push/pop. No test mnemonic (no branch in this body at all). Labels: none (straight-line body).",
+      block: {
+        mov rax, 1500000;                   // IW_RTT_STUB_NS (1.5ms)
+        mov [rcx], rax;                     // *out_rtt_ns_ptr = IW_RTT_STUB_NS
+        mov rax, 1;                         // IW_ECHO_OK
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // icmp_wire_echo_one(ip_be, seq, timeout_ms) -> u64
+  //
+  //   rdi = ip_be
+  //   rsi = seq
+  //   rdx = timeout_ms
+  //   rax (out) = echo_ok  (IcmpWire::IW_ECHO_OK | IW_ECHO_FAIL)
+  //   rdx (out) = rtt_ns   (only meaningful when rax == IW_ECHO_OK)
+  //
+  // Convenience wrapper src/entry.pdx's M2-002 (#5) `--count` loop
+  // calls once per iteration: stages a durable out_rtt_ns_ptr
+  // (iw_rtt_scratch, .bss — safe because pdxping is single-threaded
+  // and this function is never called re-entrantly) so the caller
+  // does not need its own scratch buffer or a 4th argument slot to
+  // pass one in.
+  //
+  // Register plan: 1-push prologue (rbx, alignment-only — no value
+  // needs to survive the nested call since ip_be/seq/timeout_ms
+  // already sit in rdi/rsi/rdx, sys_icmp_echo's own first three
+  // arguments, in the same order). Entry rsp%16==8, 1 push (8 bytes)
+  // lands rsp%16==0 for the one nested call below.
+  // ============================================================================
+  pub let icmp_wire_echo_one : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (ip_be: u64) (seq: u64) (timeout_ms: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxping.M2-001 (#4) / M2-002 (#5) icmp_wire_echo_one. 1-push prologue (rbx, alignment-only) lands rsp%16==0 (entry 8, 1 push=8 bytes) for the nested call to sys_icmp_echo. rbx holds no live value across the call -- it exists purely so the push count is odd, matching this file's own documented parity convention; it is popped, unexamined, before ret. ip_be/seq/timeout_ms already occupy rdi/rsi/rdx, sys_icmp_echo's own first three argument registers in the same order, so no staging is needed before the call; rcx (the 4th arg, out_rtt_ns_ptr) is loaded via lea r8, [rip + iw_rtt_scratch] into r8 then mov rcx, r8 (rip-relative addresses are always computed into a GPR first before use, per this codebase's own convention -- see e.g. src/ping_record.pdx's pdxping_record_hexdump). After the call, rax already holds echo_ok (the function's own return value, untouched by the subsequent scratch reload) and lea r8,[rip+iw_rtt_scratch]; mov rdx,[r8] loads the just-written RTT into rdx, the function's second (informal, convention-only) return slot -- the same 'declared -> u64, informally returns a second value in rdx' convention _pr_hash_host (src/ping_record.pdx) documents. Pop rbx, ret. No test mnemonic (no branch in this body at all -- sys_icmp_echo's own stub never fails, so there is nothing to branch on yet; a real body would need one). Labels: none (straight-line body).",
+      block: {
+        push rbx;                           // alignment-only; no live value carried
+
+        lea r8, [rip + iw_rtt_scratch];
+        mov rcx, r8;                        // out_rtt_ns_ptr
+        call sys_icmp_echo;                 // rax = echo_ok; rdi/rsi/rdx already staged
+
+        lea r8, [rip + iw_rtt_scratch];
+        mov rdx, [r8];                      // rtt_ns (informal 2nd return value, in rdx)
+
+        pop rbx;
+        ret;
+      }
+    }
+}

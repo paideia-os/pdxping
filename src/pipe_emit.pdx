@@ -1,0 +1,86 @@
+// src/pipe_emit.pdx — pdxping.M3-003 (#8): semantic-pipe PingRecord@0.1
+// emit (WEAK stub).
+//
+// Scope
+// -----
+// This module implements pdxping#8 (M3-003): "semantic-pipe:
+// PingRecord@0.1 emit." `src/entry.pdx` calls
+// `pdxping_pipe_emit_record` once per echo ATTEMPT — the same cadence
+// `src/audit_wire.pdx`'s `pdxping_audit_echo` already documents and
+// uses (once per `--dry-run` `--count` loop iteration, right after the
+// `PingRecord@0.1` for that iteration is built by
+// `PingRecord::pdxping_record_build`).
+//
+// STUB status (this landing) --------------------------------------------
+// The intended real body calls
+//   `sys_semantic_send(endpoint_id, buf_ptr, buf_len, schema_id)`
+// (sysno 115) to emit the 128-byte `PingRecord@0.1` over a real
+// semantic pipe. Constructing that call honestly requires two things
+// this repo does not hold at this landing:
+//
+//   1. A real `KIND_IPC_ENDPOINT` cap bound to a schema-registry-
+//      recognized channel — `caps.decl`'s own `KIND_IPC_ENDPOINT` row
+//      is a documented PLACEHOLDER ONLY ("semantic-pipe + audit-journal
+//      swap, both WEAK stubs at this landing"), the exact same
+//      unprovisioned-resource gap `AuditWire::pdxping_audit_echo`
+//      documents for `libpdx-audit`'s `audit_file_append`.
+//   2. A registered `PingRecord@0.1` `schema_id` — the schema-registry
+//      integration pattern a sibling R102-wave satellite repo
+//      (`libpdx-font`'s `FontSchema::font_schema_init`,
+//      `src/font_schema.pdx`) documents for the analogous "register
+//      then hold a schema_id" shape; no such registration call site
+//      exists in this repo yet.
+//
+// Rather than fabricate a plausible-looking `sys_semantic_send` call
+// against an endpoint_id/schema_id this repo cannot honestly populate
+// (the exact trap `elevate_gate.pdx`'s own header documents avoiding
+// for `elevate_client_acquire`), `pdxping_pipe_emit_record` below is a
+// no-op `xor rax, rax; ret`, returning `PE_OK` (0) — the same WEAK-stub
+// shape `AuditWire::pdxping_audit_echo` documents for the analogous
+// libpdx-audit gap, one file over.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module PipeEmit (PascalCase basename).
+//   - <= 4 curried arguments (`pdxping_pipe_emit_record` takes 1:
+//     record_ptr).
+//   - Leaf; no push/pop; writes only rax.
+//   - No test mnemonic (no branch in the stub body).
+//
+// Upstream: design/networking/r100-user-tools-plan.md §5.5 (paideia-os,
+// the `PingRecord@0.1` semantic-pipe emission this issue implements);
+// src/audit_wire.pdx (this repo, the identical WEAK-stub shape and
+// STUB-status write-up structure this file's header is adapted from);
+// src/ping_record.pdx (this repo, the 128-byte `PingRecord@0.1` this
+// function's future real body will send verbatim).
+
+module PipeEmit = structure {
+
+  pub let PE_OK : u64 = 0
+
+  // --- Documentation-only mirror of the intended real syscall number
+  //     (sysno 115). Not issued by the stub body below -- kept so
+  //     `grep sys_semantic_send` across the tree surfaces this call
+  //     site. ---------------------------------------------------------
+  pub let PE_SYS_SEMANTIC_SEND : u64 = 115
+
+  // ============================================================================
+  // pdxping_pipe_emit_record(record_ptr) -> u64
+  //
+  //   rdi = record_ptr  (128-byte PingRecord@0.1, see src/ping_record.pdx)
+  //   rax = PE_OK (0)   -- the STUB always succeeds trivially, since it
+  //         performs no I/O to fail at.
+  //
+  // Called once per echo ATTEMPT (see file header) -- same cadence as
+  // AuditWire::pdxping_audit_echo.
+  // ============================================================================
+  pub let pdxping_pipe_emit_record : (u64) -> u64 !{mem} @{} =
+    fn (record_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxping.M3-003 (#8) pdxping_pipe_emit_record. WEAK stub -- see file header for the full STUB-status writeup (a two-part unprovisioned-resource gap: no real KIND_IPC_ENDPOINT cap and no registered PingRecord@0.1 schema_id, neither of which this repo could honestly populate into a real sys_semantic_send call at this landing). Body: xor rax,rax; ret -- sets PE_OK (0), discards record_ptr, touches no memory despite the declared !{mem} effect (the wider declaration matches what the real sys_semantic_send body would require: mem to read the 128-byte record before staging it into the syscall's argument registers -- the same 'declare the FUTURE real body's effect set' convention AuditWire::pdxping_audit_echo documents for the identical reason). Leaf; no push/pop; writes only rax. Argument (rdi, caller-save) may be freely discarded. No test mnemonic (no branch in this body at all). Labels: none (straight-line body).",
+      block: {
+        xor rax, rax;
+        ret;
+      }
+    }
+}

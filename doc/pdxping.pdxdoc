@@ -27,16 +27,23 @@ syscall, one blocking wait for the matching reply, no traceroute, no
 MTU discovery, no flood mode (`design/networking/r100-user-tools-plan.md`
 §5, paideia-os repo).
 
-At v1.0.0 (Wave AA cohort), only the `--dry-run` path is real:
-`--count` `PingRecord@0.1` records are built and their 128 raw bytes
-previewed to fd 2 as a hex dump, one per iteration, no network I/O.
-A non-`--dry-run` invocation calls the `R_NET_PRIVILEGED_PROTOCOL`
-elevate gate before any echo attempt; the gate is a fail-closed WEAK
-stub at this landing (no broker-endpoint cap is provisioned to this
-tool), so every non-`--dry-run` invocation exits 13 with
-`[pdxping.M3-001 EACCES]` on fd 2. Real `sys_icmp_echo` (sysno 103,
-landed kernel-side at R100-PREP-003) dispatch is M2 scope, not yet
-implemented in this repo.
+At v1.1.0, only the `--dry-run` path is reachable: `--count`
+`PingRecord@0.1` records are built, each is emitted over the
+semantic-pipe path (`sys_semantic_send`, sysno 115 -- WEAK stub, no-op
+today) and audited (`libpdx-audit` -- WEAK stub, no-op today), then
+its 128 raw bytes are previewed to fd 2 as a hex dump, one per
+iteration, no network I/O. A non-`--dry-run` invocation calls the
+`R_NET_PRIVILEGED_PROTOCOL` elevate gate before any echo attempt; the
+gate is a fail-closed WEAK stub at this landing (no broker-endpoint
+cap is provisioned to this tool), so every non-`--dry-run` invocation
+exits 13 with `[pdxping.M3-001 EACCES]` on fd 2 -- even though this
+repo now implements a real `--count` `sys_icmp_echo` (sysno 103) loop
+with min/avg/max RTT + loss-percent summary stats (`src/icmp_wire.pdx`,
+`src/entry.pdx`'s `ep_real_grant` arm), that loop is unreachable until
+BOTH a real elevate-broker cap is provisioned to this tool AND the
+kernel-side gate (`cap_check_r_net_privileged_protocol`, landed at
+R100-PREP-003) opens to ordinary ring-3 callers, not just the
+boot-witness/init context.
 
 ==== EXIT STATUS
     0   OK (--dry-run completed; every PingRecord@0.1 previewed)
@@ -45,10 +52,11 @@ implemented in this repo.
         non---dry-run invocation at this landing)
 
 ==== LIMITATIONS
-See CHANGELOG.md "Known deferred substrate": M2 (real echo, RTT
-stats) is out of scope for the Wave AA cohort; `libpdx-elevate` and
-`libpdx-audit` integration are WEAK stubs pending a real cross-repo
-link path.
+See CHANGELOG.md "Known deferred substrate": the real `--count` echo
+loop, RTT/loss summary stats, `libpdx-elevate`, `libpdx-audit`, and
+semantic-pipe emit are all implemented but remain WEAK stubs / dead
+code pending a real cross-repo link path and a kernel-side gate
+opening -- every non-`--dry-run` invocation exits 13 today.
 
 ==== SEE ALSO
 [[cref: pdxcurl#NAME]], [[cref: pdxsock#NAME]], [[cref: pdxdig#NAME]]

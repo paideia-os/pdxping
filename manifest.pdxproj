@@ -1,13 +1,14 @@
 # pdxping -- paideia-as build manifest
 #
-# Wave: R100  Milestone: M1-001/M1-002/M1-003/M3-001/M3-002 (Wave AA cohort)
+# Wave: R100  Milestone: M1-001/M1-002/M1-003/M3-001/M3-002 (Wave AA
+# cohort) + M2-001/M2-002/M3-003 (Wave BB follow-up)
 # Doc:  design/networking/r100-user-tools-plan.md §5 + §13 (paideia-os repo).
 #
 # Consumed by `paideia-as build` (release-time signer path) and by the
 # tools/build.sh iterator (`src/*.pdx` glob) at day-to-day build time.
 
 name        = pdxping
-version     = 1.0.0
+version     = 1.1.0
 kind        = tool
 entry       = _start                    # src/entry.pdx
 output      = build-out/pdxping.elf
@@ -16,30 +17,37 @@ caps_decl   = caps.decl
 # --- Source list (order-insensitive; paideia-as resolves module deps
 # from `module <Basename> = structure { ... }` headers). ---------------
 sources:
-  - src/entry.pdx                 # M1-001/M1-002/M1-003/M3-001/M3-002: _start, wires every module below
+  - src/entry.pdx                 # M1-001/../M3-002 + M2-001/M2-002/M3-003: _start, wires every module below
   - src/argv_parse.pdx            # M1-002 (#2): --count/--interval-ms/--timeout-ms/--dry-run/<host>
   - src/ping_record.pdx           # M1-003 (#3): PingRecord@0.1 128B wire shape + dry-run hex preview
   - src/elevate_gate.pdx          # M3-001 (#6): R_NET_PRIVILEGED_PROTOCOL elevate gate (WEAK, fail-closed)
   - src/audit_wire.pdx            # M3-002 (#7): libpdx-audit per-echo record (WEAK stub)
+  - src/icmp_wire.pdx             # M2-001 (#4): real sys_icmp_echo call + RTT capture (WEAK stub, scaffold body only)
+  - src/pipe_emit.pdx             # M3-003 (#8): semantic-pipe PingRecord@0.1 emit (WEAK stub)
 
 # --- Library dependencies ----------------------------------------------
-# pdxping at v1.0.0 depends on nothing outside the SC+ syscall floor
+# pdxping at v1.1.0 depends on nothing outside the SC+ syscall floor
 # (sysno 1 = sys_write, 60 = sys_exit). Neither libpdx-elevate nor
 # libpdx-audit is in `deps:` at this landing -- both integration points
 # (src/elevate_gate.pdx, src/audit_wire.pdx) are WEAK stubs with a
 # stable call-site ABI, same posture pdxsock's own M3-002 landing
-# documents for the identical libpdx-audit gap. Wiring either real
-# dependency is tracked as a follow-up: (a) add the satellite to this
-# `deps:` list; (b) extend tools/build.sh's --extra-obj-dir/--extra-
-# archive invocation; (c) narrow caps.decl's placeholder rows to
-# mandatory; (d) swap each WEAK-stub body for a real call, with no
-# caller-side (src/entry.pdx) change required.
+# documents for the identical libpdx-audit gap. src/icmp_wire.pdx's
+# `sys_icmp_echo` and src/pipe_emit.pdx's `pdxping_pipe_emit_record`
+# are the same posture: real syscall numbers (103, 115) are documented
+# in-file but never issued, since the kernel-side cap gate
+# (R100-PREP-003) and the unprovisioned KIND_IPC_ENDPOINT cap
+# respectively block an honest real call today. Wiring any of these
+# real dependencies is tracked as a follow-up: (a) add the satellite to
+# this `deps:` list where applicable; (b) extend tools/build.sh's
+# --extra-obj-dir/--extra-archive invocation; (c) narrow caps.decl's
+# placeholder rows to mandatory; (d) swap each WEAK-stub body for a
+# real call, with no caller-side (src/entry.pdx) change required.
 deps: []
 
 # --- Test targets ------------------------------------------------------
-# M4 smokes (happy dry-run, elevate-denied path) are deferred to a
-# future milestone -- not part of the Wave AA cohort (pdxping#1/#2/#3/
-# #6/#7 only).
+# M4 smokes (happy dry-run, elevate-denied path, real-echo-loop once
+# reachable) are deferred to a future milestone -- not part of this
+# landing (pdxping#1/#2/#3/#4/#5/#6/#7/#8 only).
 tests: []
 
 # --- Documentation targets ---------------------------------------------
@@ -57,8 +65,9 @@ compliance:
   - curried-args-max-4            # marshal >4 logical arguments via a scratch-struct pointer instead
 
 # --- Release policy ----------------------------------------------------
-# v1.0.0 is the Wave AA cohort landing (pdxping#1/#2/#3/#6/#7). The
-# source form of the manifest lives at the repo root, `manifest.pdxsig`
+# v1.0.0 was the Wave AA cohort landing (pdxping#1/#2/#3/#6/#7); v1.1.0
+# adds the Wave BB follow-up (pdxping#4/#5/#8). The source form of the
+# manifest lives at the repo root, `manifest.pdxsig`
 # (paideia-manifest-pdxsig@1 schema, hybrid-ed25519+ml-dsa-65 signature
 # scheme), with every hash and every signature slot a documented
 # placeholder the release tool fills in at tag time. The dual-sign
@@ -72,5 +81,5 @@ release:
                                           # PLACEHOLDER_PENDING_LIVE_SIGN
                                           # sentinel the dual-sign pass
                                           # replaces.
-  mirror_target  = pkgs.paideia-os/main/pdxping/1.0.0/   # future mirror push
+  mirror_target  = pkgs.paideia-os/main/pdxping/1.1.0/   # future mirror push
   manifest_src   = manifest.pdxsig                       # source form of manifest.pdxsig

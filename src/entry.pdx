@@ -1,5 +1,6 @@
 // src/entry.pdx — pdxping.M1-001 (#1) scaffold + M1-002 (#2) + M1-003
-// (#3) + M3-001 (#6) + M3-002 (#7) — _start.
+// (#3) + M3-001 (#6) + M3-002 (#7) + M2-001 (#4) + M2-002 (#5) +
+// M3-003 (#8) — _start.
 //
 // pdxping is a standalone ring-3 ELF, not a library: this file is its
 // `_start` entry point, argv-wired per the frozen execve ABI
@@ -11,8 +12,9 @@
 //   delivers rsp%16==8 per rm/main.pdx and every other satellite
 //   tool's own `_start` precedent in this tree).
 //
-// Wave AA cohort flow (pdxping#1/#2/#3/#6/#7)
-// --------------------------------------------
+// Wave AA cohort flow (pdxping#1/#2/#3/#6/#7) + Wave BB follow-up
+// (pdxping#4/#5/#8)
+// --------------------------------------------------------------------
 //   1. Parse argv via ArgvParse::argv_parse (src/argv_parse.pdx, #2)
 //      into a 40-byte ep_argv_out scratch. On ARGV_ERR (missing
 //      <host>, unrecognized flag, malformed numeric value), print a
@@ -23,8 +25,11 @@
 //      (seq = 0..count-1). Each iteration: build one PingRecord@0.1
 //      via PingRecord::pdxping_record_build (src/ping_record.pdx, #3),
 //      fire one AuditWire::pdxping_audit_echo (src/audit_wire.pdx, #7;
-//      WEAK stub) with result_code = PR_RESULT_DRY_RUN, then preview
-//      the 128 record bytes to fd 2 via
+//      WEAK stub) with result_code = PR_RESULT_DRY_RUN, fire one
+//      PipeEmit::pdxping_pipe_emit_record (src/pipe_emit.pdx, #8; WEAK
+//      stub) with the same record -- one semantic-pipe emission per
+//      echo ATTEMPT, same cadence as the audit call it sits next to --
+//      then preview the 128 record bytes to fd 2 via
 //      PingRecord::pdxping_record_dry_run_preview. No network I/O, no
 //      elevate call -- --dry-run never reaches the M3-001 gate below.
 //      Exits 0 after the loop.
@@ -33,16 +38,22 @@
 //      echo attempt. EG_DENY (the only reachable value at this
 //      landing -- see that file's own header) writes
 //      `[pdxping.M3-001 EACCES]\n` to fd 2 and exits 13. EG_GRANT
-//      (real, wired, unreachable today -- M2's real sys_icmp_echo send
-//      is not implemented in this repo yet) falls through to a
-//      documented no-op exit 0 rather than fabricate a send.
+//      (real, wired code -- see src/icmp_wire.pdx and src/elevate_
+//      gate.pdx's own headers for why it is UNREACHABLE at this
+//      landing, since the gate above always returns EG_DENY): runs
+//      the M2-002 (#5) `--count` loop, calling IcmpWire::icmp_
+//      wire_echo_one (src/icmp_wire.pdx, #4; WEAK stub, fixed 1.5ms
+//      RTT, always echo_ok) once per iteration, accumulating rtt_sum /
+//      rtt_min / rtt_max / loss_count into ep_stats_buf, then prints a
+//      "N transmitted, M received, LOSS_PCT% loss, min/avg/max = ..."
+//      summary to fd 1 via _er_emit_summary before exiting 0.
 //
 // ----------------------------------------------------------------------
 // Exit-code table
 // ----------------------------------------------------------------------
 //
-//   0  = OK (--dry-run completed every iteration; or the unreachable
-//        EG_GRANT no-op arm)
+//   0  = OK (--dry-run completed every iteration; or the EG_GRANT
+//        arm's real-but-unreachable-today `--count` loop + summary)
 //   2  = ARGV_ERR (missing <host>, unrecognized flag, malformed
 //        numeric value)
 //   13 = R_NET_PRIVILEGED_PROTOCOL elevate refused (fail-closed; every
@@ -59,12 +70,27 @@
 // extra push/pop per call site (each callee here is a leaf or itself
 // balances its own callee-save use per its own justification).
 //
-//   rbx = &ep_argv_out (ParsedArgv base pointer, lea'd once)
-//   r12 = (phase 2 only) count, THEN reused as the loop bound --
-//         argc/argv (the _start entry args, both dead after Phase 1's
-//         `call argv_parse`) never needed a callee-save slot of their
-//         own since they are passed straight through in rdi/rsi.
-//   r13 = (phase 2 only) seq (loop index, 0..count-1)
+//   rbx = &ep_argv_out (ParsedArgv base pointer, lea'd once) --
+//         remains live across BOTH the --dry-run and EG_GRANT arms
+//         (they are mutually exclusive, so no conflict); the EG_GRANT
+//         arm reloads ParsedArgv.count/.timeout_ms from [rbx+*] each
+//         `--count` loop iteration rather than caching them in a
+//         dedicated register, trading one cheap extra mem load per
+//         iteration for keeping the register budget small (see below).
+//   r12 = (--dry-run arm) count, THEN reused as the loop bound; (EG_
+//         GRANT arm, #5) &ep_stats_buf (lea'd once, rip-relative) --
+//         these two uses are mutually exclusive by construction (the
+//         flags check at ep_real_path forks before either arm touches
+//         r12) -- argc/argv (the _start entry args, both dead after
+//         Phase 1's `call argv_parse`) never needed a callee-save slot
+//         of their own since they are passed straight through in
+//         rdi/rsi.
+//   r13 = (--dry-run arm) seq (loop index, 0..count-1); unused in the
+//         EG_GRANT arm (that arm's own loop index lives in
+//         ep_stats_buf[ES_OFF_SEQ], not a register -- see #5's own
+//         inline justification for why a memory-resident loop-state
+//         struct, not more callee-save registers, is this arm's
+//         chosen tradeoff).
 //
 // ----------------------------------------------------------------------
 // Encoder-gap discipline
@@ -72,15 +98,18 @@
 //
 // No `add reg, [mem]` anywhere. No `test` mnemonic; every zero-check is
 // `cmp reg, 0`. Reserved-label discipline: every branch label in this
-// file is prefixed `ep_`.
+// file is prefixed `ep_` (the _start body) or `er_` (_er_emit_summary).
+// No 2-op `imul`; loss_pct's `*100` and every other scaled quantity in
+// this file uses shl/add only (see _er_emit_summary's own inline
+// justification for the two-round `*10` composition).
 //
 // SC+ IDs used: 1 = sys_write(fd, buf, count), 60 = sys_exit(status).
 //
 // Upstream: design/networking/r100-user-tools-plan.md §5 (paideia-os);
 // design/user/execve-abi.md (paideia-os, the frozen argv ABI this
 // _start consumes); src/argv_parse.pdx, src/ping_record.pdx,
-// src/elevate_gate.pdx, src/audit_wire.pdx (this repo, the modules
-// this file wires together).
+// src/elevate_gate.pdx, src/audit_wire.pdx, src/icmp_wire.pdx,
+// src/pipe_emit.pdx (this repo, the modules this file wires together).
 
 module Entry = structure {
 
@@ -95,6 +124,31 @@ module Entry = structure {
   // --- PingRecord@0.1 scratch (PingRecord::PR_BYTES = 128 bytes). ------
   pub let mut ep_record_buf : [u8; 128] = uninit @align(8)
 
+  // --- M2-002 (#5) `--count` real-echo loop state + summary struct
+  //     (64 bytes). Memory-resident rather than register-resident so
+  //     the EG_GRANT arm's loop body needs no extra callee-save
+  //     registers beyond what the function's own 3-push prologue
+  //     already provides -- see the Register plan section above.
+  //
+  //       +0  seq          u64  (ES_OFF_SEQ)         -- loop index, live during the loop only
+  //       +8  rtt_sum      u64  (ES_OFF_RTT_SUM)
+  //       +16 rtt_min      u64  (ES_OFF_RTT_MIN)      -- init sentinel 0xFFFFFFFFFFFFFFFF
+  //       +24 rtt_max      u64  (ES_OFF_RTT_MAX)
+  //       +32 loss_count   u64  (ES_OFF_LOSS_COUNT)
+  //       +40 count        u64  (ES_OFF_COUNT)         -- written once, post-loop
+  //       +48 received     u64  (ES_OFF_RECEIVED)      -- written once, post-loop
+  //       +56 avg_ns       u64  (ES_OFF_AVG_NS)         -- written once, post-loop
+  pub let mut ep_stats_buf : [u8; 64] = uninit @align(8)
+
+  pub let ES_OFF_SEQ        : u64 = 0
+  pub let ES_OFF_RTT_SUM    : u64 = 8
+  pub let ES_OFF_RTT_MIN    : u64 = 16
+  pub let ES_OFF_RTT_MAX    : u64 = 24
+  pub let ES_OFF_LOSS_COUNT : u64 = 32
+  pub let ES_OFF_COUNT      : u64 = 40
+  pub let ES_OFF_RECEIVED   : u64 = 48
+  pub let ES_OFF_AVG_NS     : u64 = 56
+
   // --- Diagnostic messages (fd 2). Lengths are exact byte counts, not
   //     counting the trailing NUL the storage array happens to add. ----
   pub let ep_msg_usage : [u8; 91] =
@@ -104,6 +158,155 @@ module Entry = structure {
   pub let ep_msg_eacces : [u8; 25] = "[pdxping.M3-001 EACCES]\n\0"
   pub let ep_msg_eacces_len : u64 = 24
 
+  // --- Summary-line literals (fd 1, EG_GRANT arm, #5). Lengths are
+  //     exact byte counts, not counting the trailing NUL. ---------------
+  pub let ep_sum_lit_transmitted : [u8; 15] = " transmitted, \0"
+  pub let ep_sum_lit_transmitted_len : u64 = 14
+
+  pub let ep_sum_lit_received : [u8; 12] = " received, \0"
+  pub let ep_sum_lit_received_len : u64 = 11
+
+  pub let ep_sum_lit_loss : [u8; 9] = "% loss, \0"
+  pub let ep_sum_lit_loss_len : u64 = 8
+
+  pub let ep_sum_lit_minavgmax : [u8; 15] = "min/avg/max = \0"
+  pub let ep_sum_lit_minavgmax_len : u64 = 14
+
+  pub let ep_sum_lit_slash : [u8; 2] = "/\0"
+  pub let ep_sum_lit_slash_len : u64 = 1
+
+  pub let ep_sum_lit_ns_nl : [u8; 5] = " ns\n\0"
+  pub let ep_sum_lit_ns_nl_len : u64 = 4
+
+  // ==========================================================================
+  // _er_emit_summary(stats_ptr) -> ()
+  //
+  //   rdi = stats_ptr (&ep_stats_buf; ES_OFF_COUNT/RECEIVED/AVG_NS must
+  //         already be populated by the caller, and ES_OFF_RTT_MIN
+  //         must already be normalised to 0 when ES_OFF_RECEIVED == 0
+  //         -- see ep_real_loop_done's own inline comment)
+  //
+  // Writes "<count> transmitted, <received> received, <loss_pct>%
+  // loss, min/avg/max = <min>/<avg>/<max> ns\n" to fd 1.
+  //
+  // Register plan: 1-push prologue (rbx = stats_ptr). Entry rsp%16==8
+  // (called via a plain `call` from _start's ep_real_emit label), 1
+  // push (8 bytes) lands rsp%16==0 for every nested call to
+  // _pr_write_u64_dec (src/ping_record.pdx) below.
+  // ==========================================================================
+  pub let _er_emit_summary : (u64) -> () !{mem, sysreg} @{fs} =
+    fn (stats_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "pdxping.M2-002 (#5) _er_emit_summary. 1-push prologue (rbx=stats_ptr) lands rsp%16==0 (entry 8, 1 push=8 bytes) for every nested call to PingRecord::_pr_write_u64_dec below (that function is not a leaf w.r.t. this codebase's own caller-save contract -- src/ping_record.pdx's own header documents it touches only caller-save registers, so rbx survives every call to it untouched). Every value this function needs (count, received, loss_count, rtt_min/avg/max) is reloaded fresh from [rbx+OFFSET] immediately before each use rather than cached across a call, since _pr_write_u64_dec's contract only guarantees callee-save-register survival, and this function holds no callee-save register budget beyond rbx itself. Segments, each a literal sys_write(1, ..., N) sandwiched around a decimal print: (1) decimal(count) + ' transmitted, ' (14B); (2) decimal(received) + ' received, ' (11B); (3) loss_pct + '% loss, ' (8B) -- loss_pct = (loss_count*100)/count computed via two rounds of the shl3+shl1+add *10 composition ArgvParse::_ap_parse_u64 (src/argv_parse.pdx) already establishes for this codebase (loss*10 via r11=loss<<3, r10=loss<<1, r11+=r10; then (loss*10)*10 via the same two-step shape on r11/r10 again), guarded by cmp r8,0/je er_loss_zero (r8=count) so a --count=0 invocation (received==0, count==0) prints '0% loss' rather than dividing by zero; (4) 'min/avg/max = ' (14B) + decimal(min) + '/' (1B) + decimal(avg) + '/' (1B) + decimal(max) + ' ns\\n' (4B). Every fd is 1 (stdout) -- this is a normal result, not a diagnostic, unlike ep_msg_usage/ep_msg_eacces's fd-2 posture. Pop rbx, ret. No test mnemonic (cmp reg,0/cmp reg,imm throughout; every immediate <= 128, well within imm32). No `and` on r8-r15. No 2-op imul (the one *100 uses shl/add only, per the encoder-gap discipline section above). Reserved-label prefix er_.",
+      block: {
+        push rbx;
+        mov rbx, rdi;                        // rbx = stats_ptr
+
+        // ---- (1) decimal(count) + " transmitted, " ------------------------
+        mov rax, [rbx + 40];                 // ES_OFF_COUNT
+        mov rsi, rax;
+        mov rdi, 1;
+        call _pr_write_u64_dec;
+
+        mov rdi, 1;
+        lea rsi, [rip + ep_sum_lit_transmitted];
+        mov rdx, 14;                         // ep_sum_lit_transmitted_len
+        mov rax, 1;
+        syscall;
+
+        // ---- (2) decimal(received) + " received, " -------------------------
+        mov rax, [rbx + 48];                 // ES_OFF_RECEIVED
+        mov rsi, rax;
+        mov rdi, 1;
+        call _pr_write_u64_dec;
+
+        mov rdi, 1;
+        lea rsi, [rip + ep_sum_lit_received];
+        mov rdx, 11;                         // ep_sum_lit_received_len
+        mov rax, 1;
+        syscall;
+
+        // ---- (3) loss_pct + "% loss, " ---------------------------------------
+        mov r8, [rbx + 40];                  // ES_OFF_COUNT
+        cmp r8, 0;
+        je er_loss_zero;
+
+        mov rcx, [rbx + 32];                 // ES_OFF_LOSS_COUNT
+        mov r11, rcx;
+        shl r11, 3;                          // loss*8
+        mov r10, rcx;
+        shl r10, 1;                          // loss*2
+        add r11, r10;                        // loss*10
+        mov r10, r11;
+        shl r11, 3;                          // (loss*10)*8
+        shl r10, 1;                          // (loss*10)*2
+        add r11, r10;                        // loss*100
+
+        mov rax, r11;
+        mov rcx, r8;                         // divisor = count
+        xor rdx, rdx;
+        div rcx;                             // rax = loss_pct
+        jmp er_loss_done;
+
+      er_loss_zero:
+        xor rax, rax;                        // loss_pct = 0 (count == 0 edge case)
+
+      er_loss_done:
+        mov rsi, rax;
+        mov rdi, 1;
+        call _pr_write_u64_dec;
+
+        mov rdi, 1;
+        lea rsi, [rip + ep_sum_lit_loss];
+        mov rdx, 8;                          // ep_sum_lit_loss_len
+        mov rax, 1;
+        syscall;
+
+        // ---- (4) "min/avg/max = " + min/avg/max ------------------------------
+        mov rdi, 1;
+        lea rsi, [rip + ep_sum_lit_minavgmax];
+        mov rdx, 14;                         // ep_sum_lit_minavgmax_len
+        mov rax, 1;
+        syscall;
+
+        mov rax, [rbx + 16];                 // ES_OFF_RTT_MIN
+        mov rsi, rax;
+        mov rdi, 1;
+        call _pr_write_u64_dec;
+
+        mov rdi, 1;
+        lea rsi, [rip + ep_sum_lit_slash];
+        mov rdx, 1;                          // ep_sum_lit_slash_len
+        mov rax, 1;
+        syscall;
+
+        mov rax, [rbx + 56];                 // ES_OFF_AVG_NS
+        mov rsi, rax;
+        mov rdi, 1;
+        call _pr_write_u64_dec;
+
+        mov rdi, 1;
+        lea rsi, [rip + ep_sum_lit_slash];
+        mov rdx, 1;                          // ep_sum_lit_slash_len
+        mov rax, 1;
+        syscall;
+
+        mov rax, [rbx + 24];                 // ES_OFF_RTT_MAX
+        mov rsi, rax;
+        mov rdi, 1;
+        call _pr_write_u64_dec;
+
+        mov rdi, 1;
+        lea rsi, [rip + ep_sum_lit_ns_nl];
+        mov rdx, 4;                          // ep_sum_lit_ns_nl_len
+        mov rax, 1;
+        syscall;
+
+        pop rbx;
+        ret;
+      }
+    }
+
   // ==========================================================================
   // _start -- user program entry point. Never returns (every terminal
   // path ends in sys_exit).
@@ -112,7 +315,7 @@ module Entry = structure {
     fn () -> unsafe {
       effects: {mem, sysreg},
       capabilities: {fs, sched},
-      justification: "pdxping.M1-001 (#1) scaffold + M1-002 (#2) + M1-003 (#3) + M3-001 (#6) + M3-002 (#7): pdxping _start. 3-push prologue (rbx/r12/r13, 24 bytes) lands rsp%16==0 from entry 8, covering every nested call below. Phase 1: rdi=argc (unchanged from entry), rsi=argv (unchanged from entry), rdx=&ep_argv_out (rip-relative lea); call argv_parse. On a non-zero return (ArgvParse::AP_ERR), jump to the usage-error arm: sys_write(2, ep_msg_usage, 90), sys_exit(2) -- no audit record opened, see module header. On ArgvParse::AP_OK: rbx = &ep_argv_out (rip-relative lea, held for the rest of this function). Gate: rax = [rbx+24] (ParsedArgv.flags) & 1 (ArgvParse::AP_FLAG_DRY_RUN); cmp rax,0; je ep_real_path when --dry-run was not given. --dry-run path (ep_dry_run): r12 = [rbx+0] (ParsedArgv.count, loop bound), r13 = 0 (seq, loop index). ep_dry_loop_head: cmp r13,r12; jge ep_dry_done. Per iteration: (a) rdi=&ep_record_buf, rsi=[rbx+32] (host_ptr), rdx=[rbx+0] (count), rcx=[rbx+16] (timeout_ms); call pdxping_record_build (src/ping_record.pdx). (b) rdi=r13 (seq), rsi=4 (PingRecord::PR_RESULT_DRY_RUN), rdx=0 (rtt_ns); call pdxping_audit_echo (src/audit_wire.pdx, WEAK stub, #7) -- fired once per echo ATTEMPT, i.e. once per dry-run iteration, per this issue's own 'not per session' instruction. (c) rdi=&ep_record_buf, rsi=r13 (seq), rdx=[rbx+32] (host_ptr); call pdxping_record_dry_run_preview (src/ping_record.pdx, #3) -- the fd-2 hex preview line. add r13,1; jmp ep_dry_loop_head. ep_dry_done: sys_exit(0). Non---dry-run path (ep_real_path, #6): call pdxping_elevate_check_and_require (src/elevate_gate.pdx) -> rax in {ElevateGate::EG_DENY=0, EG_GRANT=1}; cmp rax,1; je ep_real_grant. EG_DENY (the only reachable value at this landing): sys_write(2, ep_msg_eacces, 24), sys_exit(13). ep_real_grant (real, wired, unreachable today -- M2's real sys_icmp_echo send is not implemented in this repo yet): sys_exit(0) as a documented no-op rather than fabricate a send. Every terminal path ends in sys_exit (never returns); a trailing hlt on each path is defensive belt-and-suspenders. No `add reg,[mem]`; every zero-check is cmp reg,0 (no test mnemonic). Every cmp reg,imm <= 91 (imm32-safe). Labels prefixed ep_.",
+      justification: "pdxping.M1-001 (#1) scaffold + M1-002 (#2) + M1-003 (#3) + M3-001 (#6) + M3-002 (#7) + M2-001 (#4) + M2-002 (#5) + M3-003 (#8): pdxping _start. 3-push prologue (rbx/r12/r13, 24 bytes) lands rsp%16==0 from entry 8, covering every nested call below. Phase 1: rdi=argc (unchanged from entry), rsi=argv (unchanged from entry), rdx=&ep_argv_out (rip-relative lea); call argv_parse. On a non-zero return (ArgvParse::AP_ERR), jump to the usage-error arm: sys_write(2, ep_msg_usage, 90), sys_exit(2) -- no audit record opened, see module header. On ArgvParse::AP_OK: rbx = &ep_argv_out (rip-relative lea, held for the rest of this function). Gate: rax = [rbx+24] (ParsedArgv.flags) & 1 (ArgvParse::AP_FLAG_DRY_RUN); cmp rax,0; je ep_real_path when --dry-run was not given. --dry-run path (ep_dry_run): r12 = [rbx+0] (ParsedArgv.count, loop bound), r13 = 0 (seq, loop index). ep_dry_loop_head: cmp r13,r12; jge ep_dry_done. Per iteration: (a) rdi=&ep_record_buf, rsi=[rbx+32] (host_ptr), rdx=[rbx+0] (count), rcx=[rbx+16] (timeout_ms); call pdxping_record_build (src/ping_record.pdx). (b) rdi=r13 (seq), rsi=4 (PingRecord::PR_RESULT_DRY_RUN), rdx=0 (rtt_ns); call pdxping_audit_echo (src/audit_wire.pdx, WEAK stub, #7) -- fired once per echo ATTEMPT, i.e. once per dry-run iteration, per this issue's own 'not per session' instruction. (c) rdi=&ep_record_buf; call pdxping_pipe_emit_record (src/pipe_emit.pdx, WEAK stub, #8) -- same per-attempt cadence as (b), one semantic-pipe emission per dry-run iteration. (d) rdi=&ep_record_buf, rsi=r13 (seq), rdx=[rbx+32] (host_ptr); call pdxping_record_dry_run_preview (src/ping_record.pdx, #3) -- the fd-2 hex preview line. add r13,1; jmp ep_dry_loop_head. ep_dry_done: sys_exit(0). Non---dry-run path (ep_real_path, #6): call pdxping_elevate_check_and_require -> rax in {ElevateGate::EG_DENY=0, EG_GRANT=1}; cmp rax,1; je ep_real_grant. EG_DENY (the only reachable value at this landing): sys_write(2, ep_msg_eacces, 24), sys_exit(13). ep_real_grant (#4/#5, real and wired but UNREACHABLE today since the gate above always returns EG_DENY -- see src/icmp_wire.pdx's own header): r12 = &ep_stats_buf (rip-relative lea, held for the whole arm); init ep_stats_buf's five running fields (seq/rtt_sum/rtt_max/loss_count = 0, rtt_min = 0xFFFFFFFFFFFFFFFF sentinel). ep_real_loop_head: rax=[r12+0] (seq), rcx=[rbx+0] (count, reloaded fresh each iteration -- see Register plan section for why this trades a cheap mem load for not needing a 4th callee-save slot); cmp rax,rcx; jge ep_real_loop_done. Per iteration: rdi=0 (ip_be placeholder -- no DNS/IP-resolve path in this cohort), rsi=[r12+0] (seq), rdx=[rbx+16] (timeout_ms); call icmp_wire_echo_one (src/icmp_wire.pdx, WEAK stub, #4) -> rax=echo_ok, rdx=rtt_ns. cmp rax,1 (IcmpWire::IW_ECHO_OK); jne ep_real_lost. On OK: rtt_sum+=rtt_ns, rtt_min=min(rtt_min,rtt_ns) via cmp+conditional store (ep_real_skip_min), rtt_max=max(rtt_max,rtt_ns) via cmp+conditional store (ep_real_skip_max). On loss (ep_real_lost): loss_count+=1. Either way (ep_real_next): seq+=1; jmp ep_real_loop_head. ep_real_loop_done: count=[rbx+0] stored to ES_OFF_COUNT; received=count-loss_count stored to ES_OFF_RECEIVED; if received==0 (--count=0 edge case, or -- unreachable today since the stub never fails -- a hypothetical all-loss run), avg_ns=0 and rtt_min is force-reset to 0 (clearing the 0xFFFF...F sentinel so the printed summary reads '0' rather than a giant garbage number) via ep_real_avg_calc's else-arm; otherwise avg_ns = rtt_sum/received via one `div`. ep_real_emit: rdi=r12 (&ep_stats_buf); call _er_emit_summary (this module, #5) -- the fd-1 'N transmitted, M received, ...' line. sys_exit(0). Every terminal path ends in sys_exit (never returns); a trailing hlt on each path is defensive belt-and-suspenders. No `add reg,[mem]`; every zero-check is cmp reg,0 (no test mnemonic). Every cmp reg,imm <= 128 (imm32-safe). No `and` on r8-r15. No 2-op imul. Labels prefixed ep_.",
       block: {
         push rbx;
         push r12;
@@ -146,7 +349,7 @@ module Entry = structure {
         je ep_real_path;
 
         // =====================================================================
-        // --dry-run path (#3, #7). r12/r13 repurposed as loop bound / index.
+        // --dry-run path (#3, #7, #8). r12/r13 repurposed as loop bound / index.
         // =====================================================================
         mov r12, [rbx + 0];                  // r12 = count (AP_OFF_COUNT)
         mov r13, 0;                          // r13 = seq
@@ -168,7 +371,11 @@ module Entry = structure {
         xor rdx, rdx;                        // rtt_ns = 0 (no real echo attempted)
         call pdxping_audit_echo;
 
-        // ---- (c) fd-2 hex preview (#3). --------------------------------------
+        // ---- (c) semantic-pipe emit: one record per echo attempt (#8). -------
+        lea rdi, [rip + ep_record_buf];
+        call pdxping_pipe_emit_record;
+
+        // ---- (d) fd-2 hex preview (#3). --------------------------------------
         lea rdi, [rip + ep_record_buf];
         mov rsi, r13;                        // seq
         mov rdx, [rbx + 32];                 // host_ptr
@@ -204,9 +411,91 @@ module Entry = structure {
         syscall;
         hlt;
 
+        // =====================================================================
+        // EG_GRANT (#4, #5): real, wired -- UNREACHABLE today (see
+        // src/icmp_wire.pdx's header). r12 repurposed as &ep_stats_buf.
+        // =====================================================================
       ep_real_grant:
-        // Real, wired, unreachable at this landing -- see file header.
-        xor rdi, rdi;                        // status = 0 (OK, documented no-op)
+        lea r12, [rip + ep_stats_buf];
+
+        xor rax, rax;
+        mov [r12 + 0], rax;                  // ES_OFF_SEQ = 0
+        mov [r12 + 8], rax;                  // ES_OFF_RTT_SUM = 0
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        mov [r12 + 16], rax;                 // ES_OFF_RTT_MIN = MAX_U64 sentinel
+        xor rax, rax;
+        mov [r12 + 24], rax;                 // ES_OFF_RTT_MAX = 0
+        mov [r12 + 32], rax;                 // ES_OFF_LOSS_COUNT = 0
+
+      ep_real_loop_head:
+        mov rax, [r12 + 0];                  // seq
+        mov rcx, [rbx + 0];                  // count (AP_OFF_COUNT), reloaded each iter
+        cmp rax, rcx;
+        jge ep_real_loop_done;
+
+        xor rdi, rdi;                        // ip_be placeholder (no DNS/IP-resolve)
+        mov rsi, [r12 + 0];                  // seq
+        mov rdx, [rbx + 16];                 // timeout_ms (AP_OFF_TIMEOUT_MS)
+        call icmp_wire_echo_one;             // rax = echo_ok, rdx = rtt_ns
+
+        cmp rax, 1;                          // IcmpWire::IW_ECHO_OK
+        jne ep_real_lost;
+
+        mov rax, [r12 + 8];
+        add rax, rdx;
+        mov [r12 + 8], rax;                  // rtt_sum += rtt_ns
+
+        mov rax, [r12 + 16];
+        cmp rdx, rax;
+        jge ep_real_skip_min;
+        mov [r12 + 16], rdx;                 // rtt_min = rtt_ns
+      ep_real_skip_min:
+        mov rax, [r12 + 24];
+        cmp rdx, rax;
+        jle ep_real_skip_max;
+        mov [r12 + 24], rdx;                 // rtt_max = rtt_ns
+      ep_real_skip_max:
+        jmp ep_real_next;
+
+      ep_real_lost:
+        mov rax, [r12 + 32];
+        add rax, 1;
+        mov [r12 + 32], rax;                 // loss_count += 1
+
+      ep_real_next:
+        mov rax, [r12 + 0];
+        add rax, 1;
+        mov [r12 + 0], rax;                  // seq += 1
+        jmp ep_real_loop_head;
+
+      ep_real_loop_done:
+        mov rax, [rbx + 0];                  // count
+        mov [r12 + 40], rax;                 // ES_OFF_COUNT
+
+        mov rcx, [r12 + 32];                 // loss_count
+        sub rax, rcx;                        // received = count - loss_count
+        mov [r12 + 48], rax;                 // ES_OFF_RECEIVED
+
+        cmp rax, 0;
+        jne ep_real_avg_calc;
+
+        xor rdx, rdx;
+        mov [r12 + 56], rdx;                 // avg_ns = 0 (nothing received)
+        mov [r12 + 16], rdx;                 // rtt_min = 0 (clear sentinel for a clean print)
+        jmp ep_real_emit;
+
+      ep_real_avg_calc:
+        mov rcx, rax;                        // divisor = received
+        mov rax, [r12 + 8];                  // rtt_sum
+        xor rdx, rdx;
+        div rcx;                             // rax = avg_ns
+        mov [r12 + 56], rax;                 // ES_OFF_AVG_NS
+
+      ep_real_emit:
+        mov rdi, r12;                        // &ep_stats_buf
+        call _er_emit_summary;
+
+        xor rdi, rdi;                        // status = 0 (OK, documented no-op today)
         mov rax, 60;
         syscall;
         hlt;

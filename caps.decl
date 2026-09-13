@@ -11,9 +11,18 @@
 # R_NET_PRIVILEGED_PROTOCOL elevate class (paideia-os
 # design/networking/r100-user-tools-plan.md §5). Wave AA (pdxping#1,
 # M1-001 scaffold): this decl declares the exec-time cap surface for
-# the M1 scaffold + M3 elevate-gate wiring landed in this cohort.
-# M2 (real sys_icmp_echo, sysno 103) is OUT OF SCOPE for this cohort
-# (pdxping#4/#5, not yet opened) -- see README.md and CHANGELOG.md.
+# the M1 scaffold + M3 elevate-gate wiring landed in that cohort.
+# Wave BB follow-up (pdxping#4/#5/#8): M2 (real sys_icmp_echo, sysno
+# 103, src/icmp_wire.pdx) and M3-003 (semantic-pipe emit, sysno 115,
+# src/pipe_emit.pdx) now have real, wired call sites, but both remain
+# WEAK stubs -- neither a real broker-endpoint cap nor a real
+# KIND_IPC_ENDPOINT binding is provisioned to this tool yet, and the
+# EG_GRANT arm that would reach icmp_wire.pdx's call is itself
+# unreachable while ElevateGate::pdxping_elevate_check_and_require
+# always returns EG_DENY (see src/elevate_gate.pdx, src/icmp_wire.pdx).
+# No cap-surface change was needed for either: this decl's rows below
+# already anticipated exactly this shape at M1-001. See README.md and
+# CHANGELOG.md.
 #
 # Kind rationale:
 #   KIND_USER              -- invoker attribution (audit-record
@@ -46,16 +55,18 @@
 #                              `!`) because the WEAK stub never
 #                              actually dereferences a held cap.
 #
-#   KIND_IPC_ENDPOINT       -- optional; reserved for the future
-#                              semantic-pipe PingRecord@0.1 emission
-#                              path (design doc §5.5) and for
-#                              AuditWire's real libpdx-audit swap
-#                              (audit_file_append, once linkable --
-#                              see src/audit_wire.pdx). Neither call
-#                              site is real at this landing (both are
-#                              WEAK stubs), so this row is
-#                              documentation-only, matching pdxsock's
-#                              own KIND_IPC_ENDPOINT precedent.
+#   KIND_IPC_ENDPOINT       -- optional; reserved for the semantic-pipe
+#                              PingRecord@0.1 emission path (design doc
+#                              §5.5, src/pipe_emit.pdx, landed pdxping#8)
+#                              and for AuditWire's real libpdx-audit
+#                              swap (audit_file_append, once linkable --
+#                              see src/audit_wire.pdx). Both call sites
+#                              now exist and are real, wired code, but
+#                              both are still WEAK stubs (no real
+#                              endpoint/broker cap is provisioned), so
+#                              this row remains documentation-only,
+#                              matching pdxsock's own KIND_IPC_ENDPOINT
+#                              precedent.
 
 !KIND_USER              0x001   # invoker attribution (audit identity)
  KIND_ELEVATE_CHANNEL   0x191   # placeholder only -- elevate_gate.pdx WEAK-stubs DENY, never dereferences a held cap
