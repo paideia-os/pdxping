@@ -3,6 +3,24 @@
 All notable changes to `pdxping` are recorded here. Format: keep-a-
 changelog-style, semver-ordered, newest first.
 
+## [1.3.0] -- Wave eps-02 (2026-09-14)
+
+sys_sched_wait_ns (SC+116) integration.
+
+### Changed
+
+- **eps-02: interval pacing via `sys_sched_wait_ns`.** Both `--count`
+  loops in `src/entry.pdx` (the reachable `--dry-run` arm and the
+  still-unreachable `EG_GRANT` real-echo arm) now call the kernel's
+  `sys_sched_wait_ns(interval_ms * 1_000_000)` (SC+116) between echo
+  attempts instead of firing back-to-back with no pacing, honoring the
+  existing `--interval-ms` argv flag (`ArgvParse::AP_OFF_INTERVAL_MS`,
+  default 1000). No extern trampoline module exists in this repo (every
+  syscall here is inlined via `mov rax,<sysno>; syscall`), so the new
+  call is inlined the same way at both sites. `ns` is computed via two
+  rounds of a shl10/shl4/shl3+sub `*1000` composition (no imul/mul), per
+  this file's own encoder-gap discipline.
+
 ## [1.2.0] -- Wave ZZ tail (2026-09-13)
 
 Closes pdxping#9. Closes pdxping#10. Closes pdxping#11. Closes pdxping#12. Closes pdxping#13.
