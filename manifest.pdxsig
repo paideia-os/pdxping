@@ -1,18 +1,22 @@
-# pdxping v1.0.0 — release manifest (source form)
+# pdxping v1.2.0 — release manifest (source form)
 #
-# This is the human-readable SOURCE FORM of `manifest.pdxsig`, unsigned,
-# per pdxping#1 (M1-001 scaffold). The release tool at pkgs.paideia-os
-# mirror-push time (a) enumerates the artifact list below, (b)
-# recomputes every BLAKE3-256 hash from the repo tree at the v1.0.0
-# tag, (c) writes the completed manifest into a binary `manifest.pdxsig`,
-# and (d) invokes
+# This is the human-readable SOURCE FORM of `manifest.pdxsig`, unsigned.
+# First landed at v1.0.0 (pdxping#1, M1-001 scaffold); updated at v1.1.0
+# (Wave BB follow-up, pdxping#4/#5/#8) and again here at v1.2.0 (Wave ZZ
+# tail, pdxping#9/#10/#11/#12/#13 -- M4 smoke drivers + the M5 signed
+# release itself). The release tool at pkgs.paideia-os mirror-push time
+# (a) enumerates the artifact list below, (b) recomputes every
+# BLAKE3-256 hash from the repo tree at the v1.2.0 tag, (c) writes the
+# completed manifest into a binary `manifest.pdxsig`, and (d) invokes
 #   paideia-pq-sign::sign_release_artifact(sk, manifest_path)
 # once with the paideia-release-line Ed25519 secret key and once with
 # the ML-DSA-65 secret key. The two detached signatures are appended to
 # the manifest in the fixed layout below and the resulting
 # `manifest.pdxsig` is pushed to
-#   https://pkgs.paideia-os/main/pdxping/1.0.0/manifest.pdxsig
-# alongside the compiled artifacts.
+#   https://pkgs.paideia-os/main/pdxping/1.2.0/manifest.pdxsig
+# alongside the compiled artifacts -- see release/mirror-push.md (#13)
+# for why that push is placeholder scaffolding at this landing, same as
+# the dual-sign pass below.
 #
 # Format mirrors `umount.pdxfs`'s and `pdxsock`'s own
 # `release/manifest.pdxsig.txt` byte-for-byte in structure. Every
@@ -31,18 +35,18 @@
 format-version:      1
 manifest-schema:     paideia-manifest-pdxsig@1
 package-name:        pdxping
-package-version:     1.0.0
-package-release:     R100-WaveAA-M1M3            # Wave AA cohort: M1-001/M1-002/M1-003/M3-001/M3-002
+package-version:     1.2.0
+package-release:     R100-WaveZZ-M4M5            # Wave ZZ tail: M4-001/M4-002/M4-003/M5-001/M5-002
 package-license:     MIT
 source-repo:         https://github.com/paideia-os/pdxping
-source-commit:       <TAG-v1.0.0-COMMIT-SHA>     # release tool fills in
-source-tag:          v1.0.0
+source-commit:       <TAG-v1.2.0-COMMIT-SHA>     # release tool fills in
+source-tag:          v1.2.0
 
 # ---------------------------------------------------------------
 # Artifact set — every file the compiled package ships. The hash
 # discipline is BLAKE3-256, upper 32 bytes rendered as 64 hex chars.
 # The release tool recomputes each hash from the working tree at the
-# v1.0.0 tag before writing the binary manifest. The order below is
+# v1.2.0 tag before writing the binary manifest. The order below is
 # stable (lexicographic within each section) so the concatenated
 # hash-input is reproducible across signers.
 # ---------------------------------------------------------------
@@ -53,7 +57,14 @@ src/argv_parse.pdx                 blake3-256 = <BLAKE3-argv_parse.pdx>
 src/audit_wire.pdx                 blake3-256 = <BLAKE3-audit_wire.pdx>
 src/elevate_gate.pdx               blake3-256 = <BLAKE3-elevate_gate.pdx>
 src/entry.pdx                      blake3-256 = <BLAKE3-entry.pdx>
+src/icmp_wire.pdx                  blake3-256 = <BLAKE3-icmp_wire.pdx>
 src/ping_record.pdx                blake3-256 = <BLAKE3-ping_record.pdx>
+src/pipe_emit.pdx                  blake3-256 = <BLAKE3-pipe_emit.pdx>
+
+[artifacts.tests]
+tests/pdxping_happy_smoke.pdx           blake3-256 = <BLAKE3-pdxping_happy_smoke.pdx>
+tests/pdxping_timeout_smoke.pdx         blake3-256 = <BLAKE3-pdxping_timeout_smoke.pdx>
+tests/pdxping_elevate_denied_smoke.pdx  blake3-256 = <BLAKE3-pdxping_elevate_denied_smoke.pdx>
 
 [artifacts.doc]
 doc/pdxping.pdxdoc                 blake3-256 = <BLAKE3-pdxping.pdxdoc>
@@ -63,10 +74,14 @@ LICENSE                            blake3-256 = <BLAKE3-LICENSE>
 README.md                          blake3-256 = <BLAKE3-README.md>
 CHANGELOG.md                       blake3-256 = <BLAKE3-CHANGELOG.md>
 
+[artifacts.release]
+release/mirror-push.md             blake3-256 = <BLAKE3-mirror-push.md>
+
 # ---------------------------------------------------------------
-# Cross-repo dependencies. Empty at v1.0.0 — see CHANGELOG.md "Known
-# deferred substrate" for why libpdx-elevate/libpdx-audit are named
-# only in source comments, not as real link-time dependencies.
+# Cross-repo dependencies. Still empty at v1.2.0 (manifest.pdxproj's
+# own `deps: []`) — see CHANGELOG.md "Known deferred substrate" for why
+# libpdx-elevate/libpdx-audit are named only in source comments, not as
+# real link-time dependencies.
 # ---------------------------------------------------------------
 
 [depends-on]
@@ -92,8 +107,15 @@ kernel-syscall          = sys_icmp_echo (sysno 103) -- landed
                           (R100-PREP-003, paideia-os#2009), gated by
                           cap_check_r_net_privileged_protocol, which
                           at HEAD permits only the boot-witness/init
-                          context. NOT CALLED by this release (M2 is
-                          out of scope for the Wave AA cohort).
+                          context. src/icmp_wire.pdx's real, wired
+                          --count loop documents this sysno but never
+                          issues it (WEAK stub); UNREACHABLE at this
+                          release since ElevateGate::pdxping_elevate_
+                          check_and_require always returns EG_DENY.
+kernel-syscall          = sys_semantic_send (sysno 115) -- documented
+                          in src/pipe_emit.pdx, never issued (WEAK
+                          stub; no real KIND_IPC_ENDPOINT binding is
+                          provisioned to this tool at this release).
 
 # ---------------------------------------------------------------
 # Signature block — dual-signed per design/02-development-environment.md

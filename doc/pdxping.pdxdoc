@@ -27,7 +27,7 @@ syscall, one blocking wait for the matching reply, no traceroute, no
 MTU discovery, no flood mode (`design/networking/r100-user-tools-plan.md`
 §5, paideia-os repo).
 
-At v1.1.0, only the `--dry-run` path is reachable: `--count`
+At v1.2.0, only the `--dry-run` path is reachable: `--count`
 `PingRecord@0.1` records are built, each is emitted over the
 semantic-pipe path (`sys_semantic_send`, sysno 115 -- WEAK stub, no-op
 today) and audited (`libpdx-audit` -- WEAK stub, no-op today), then
@@ -57,6 +57,14 @@ loop, RTT/loss summary stats, `libpdx-elevate`, `libpdx-audit`, and
 semantic-pipe emit are all implemented but remain WEAK stubs / dead
 code pending a real cross-repo link path and a kernel-side gate
 opening -- every non-`--dry-run` invocation exits 13 today.
+
+M4 smoke coverage (`tests/pdxping_happy_smoke.pdx`,
+`tests/pdxping_timeout_smoke.pdx`,
+`tests/pdxping_elevate_denied_smoke.pdx`) exists as compile-only
+pipeline-replay drivers -- each exports `run() -> u64`, is compiled by
+`tools/build.sh`'s own `tests/*.pdx` glob to verify it assembles, but
+none is linked or executed under real QEMU boot yet (see
+`tests/README.md`).
 
 ==== SEE ALSO
 [[cref: pdxcurl#NAME]], [[cref: pdxsock#NAME]], [[cref: pdxdig#NAME]]

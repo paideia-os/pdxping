@@ -3,6 +3,78 @@
 All notable changes to `pdxping` are recorded here. Format: keep-a-
 changelog-style, semver-ordered, newest first.
 
+## [1.2.0] -- Wave ZZ tail (2026-09-13)
+
+Closes pdxping#9. Closes pdxping#10. Closes pdxping#11. Closes pdxping#12. Closes pdxping#13.
+
+### Added
+
+- **M4-001 (#9): happy-path smoke.** `tests/pdxping_happy_smoke.pdx`
+  (`Module PdxpingHappySmoke`) drives `pdxping --count=3 10.0.2.2`
+  through the real, linked `ArgvParse::argv_parse`, then a 3-iteration
+  loop against a local always-succeeding echo fixture
+  (`_phs_mock_echo_ok`, rtt=2ms -- distinct from `IcmpWire::icmp_wire_
+  echo_one`'s own fixed 1.5ms WEAK stub, since paideia-as's ELF emitter
+  never marks function symbols weak (`PA10-007`) and there is therefore
+  no link-time override of the real stub). Recomputes `received`/
+  `loss_pct` via the same shl3+shl1+add `*10`-composition formula
+  `Entry::_er_emit_summary` uses and asserts the
+  "3 transmitted, 3 received, 0% loss" fingerprint.
+- **M4-002 (#10): timeout-path smoke.** `tests/pdxping_timeout_smoke.pdx`
+  (`Module PdxpingTimeoutSmoke`) — same shape, driving `pdxping
+  --count=3 203.0.113.1` (RFC 5737 TEST-NET-3) against a local
+  always-timing-out fixture (`_pts_mock_echo_timeout`). Asserts the
+  "3 transmitted, 0 received, 100% loss" fingerprint.
+- **M4-003 (#11): elevate-denied-path smoke.**
+  `tests/pdxping_elevate_denied_smoke.pdx`
+  (`Module PdxpingElevateDeniedSmoke`) calls the real `ElevateGate::
+  pdxping_elevate_check_and_require` directly (no mock needed -- its
+  WEAK stub already always returns `EG_DENY`), asserts that, then
+  byte-compares `Entry::ep_msg_eacces`'s 24 bytes against a local
+  expected `"[pdxping.M3-001 EACCES]\n"` literal. Flags, without
+  fabricating a passing assertion around it, a pre-existing
+  documentation/implementation drift: `src/audit_wire.pdx`'s own header
+  states `pdxping_audit_echo` is called on this path with
+  `result_code = PR_RESULT_NO_PERMISSION`, but `src/entry.pdx`'s actual
+  `ep_real_path` EG_DENY arm never calls it.
+- **`tests/README.md`**: documents the pipeline-replay-driver
+  convention (why these are not literal `pdxping ...` subprocess
+  invocations), the return-code convention, and why
+  `IcmpWire::icmp_wire_echo_one` is mocked locally per-driver rather
+  than overridden.
+- **M5-001 (#12): dual-signed release.** `manifest.pdxsig` (source
+  form) bumped to v1.2.0: `package-version`/`package-release`/
+  `source-tag` updated, the three new `tests/*.pdx` drivers added under
+  a new `[artifacts.tests]` section, `release/mirror-push.md` added
+  under a new `[artifacts.release]` section, and `src/icmp_wire.pdx` /
+  `src/pipe_emit.pdx` backfilled into `[artifacts.source]` (a v1.1.0
+  gap -- those two files landed at 1.1.0 but this manifest's source
+  form was never updated to list them until now). The dual-sign pass
+  itself remains NOT PERFORMED (`SIGNATURE_PLACEHOLDER_PENDING_LIVE_
+  SIGN` in every signature slot) -- release-line seed keys are
+  hardware-backed/KMS-custody, never repo-resident, per
+  `design/02-development-environment.md` §1164. `doc/pdxping.pdxdoc`
+  reviewed; its LIMITATIONS section now notes the M4 smoke coverage.
+- **M5-002 (#13): mirror push scaffolding.** `release/mirror-push.md`
+  documents the intended mirror-push pipeline (`pkgs.paideia-os/main/
+  pdxping/1.2.0/`) and states plainly that the real push is blocked on
+  release-infra R32 (the mirror-hosting/push-pipeline infrastructure
+  itself) -- this landing ships documentation-only scaffolding, no
+  push is performed or possible from this repo.
+
+### Known deferred substrate (carried forward)
+
+- All M4 drivers are compile-only at this landing: `tools/build.sh`'s
+  `tests/*.pdx` glob compiles each to verify it assembles, but none are
+  linked or executed. There is no QEMU-boot argv/subprocess harness for
+  a standalone CLI tool anywhere in the R100 wave yet -- see
+  `tests/README.md` "What a full QEMU smoke matrix still needs".
+- The `EG_GRANT` arm (M2-001/M2-002's real echo loop) remains
+  unreachable in practice, unchanged from v1.1.0 -- see that release's
+  own note below.
+- The mirror push (#13) is documentation-only; no real network push to
+  `pkgs.paideia-os` occurs from this repo or this landing.
+
 ## [1.1.0] -- Wave BB follow-up (2026-09-13)
 
 Closes pdxping#4. Closes pdxping#5. Closes pdxping#8.

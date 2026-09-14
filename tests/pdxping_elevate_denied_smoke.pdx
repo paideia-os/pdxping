@@ -1,0 +1,171 @@
+// tests/pdxping_elevate_denied_smoke.pdx — pdxping.M4-003 (#11)
+// PdxpingElevateDeniedSmoke: elevate-denied-path smoke -- confirms
+// fail-closed behaviour + the exact fd-2 diagnostic `src/entry.pdx`
+// emits on `R_NET_PRIVILEGED_PROTOCOL` refusal.
+//
+// ================================================================
+// Why the REAL ElevateGate::pdxping_elevate_check_and_require is
+// called directly here, with no mock
+// ================================================================
+//
+// Unlike `icmp_wire_echo_one` (mocked by the two sibling drivers in
+// this directory, since its real WEAK stub always SUCCEEDS and this
+// suite needs both a success and a failure fixture),
+// `ElevateGate::pdxping_elevate_check_and_require`'s real WEAK stub
+// (src/elevate_gate.pdx) already always returns `EG_DENY` -- exactly
+// the behaviour this issue asks to confirm. No mock is needed or
+// appropriate: calling the real, linked function IS the correct way to
+// exercise this path, matching `mkfs.pdxfs`'s own
+// `tests/test_device_target_smoke.pdx` precedent of calling a real
+// stub directly when its documented behaviour already matches what the
+// test needs.
+//
+// ================================================================
+// What "correct exit code (NO_PERMISSION result_code)" means for a
+// pipeline-replay driver, not a subprocess
+// ================================================================
+//
+// `src/entry.pdx`'s `ep_real_path` label is the real, linked dispatch
+// this driver replays: on `EG_DENY`, it writes `ep_msg_eacces` (24
+// bytes, "[pdxping.M3-001 EACCES]\n") to fd 2 and calls
+// `sys_exit(13)`. Neither the literal `sys_write`/`sys_exit` nor the
+// process exit code itself is observable from a compile-only,
+// never-linked `u64`-returning driver (`run()` cannot execute a real
+// syscall on this repo's behalf and report the OS-level exit status
+// back to a caller) -- so this driver asserts the two things it CAN
+// observe end-to-end: (1) the real gate genuinely returns `EG_DENY`,
+// and (2) the exact 24-byte diagnostic `src/entry.pdx` would emit on
+// that path, byte-for-byte, against a local expected literal. The
+// `sys_exit(13)` status itself is a bare immediate operand in
+// `src/entry.pdx`'s own block (`mov rdi, 13;`), not an exported symbol
+// this driver could cross-reference -- verified by source inspection of
+// that file's `ep_real_path` EG_DENY arm instead of a runtime assertion
+// here, the same honest-scoping posture this repo's own module headers
+// take toward values no code path can honestly observe (see e.g.
+// `src/elevate_gate.pdx`'s own header).
+//
+// `PingRecord::PR_RESULT_NO_PERMISSION` (this issue's own
+// "NO_PERMISSION result_code" phrase, value 3) is the `result_code`
+// `src/audit_wire.pdx`'s own module header DOCUMENTS as the intended
+// value for this exact path ("once for the M3-001 elevate refusal ...
+// result_code = PingRecord::PR_RESULT_NO_PERMISSION"). Reading
+// `src/entry.pdx`'s actual `ep_real_path` block, however,
+// `AuditWire::pdxping_audit_echo` is NOT called on the EG_DENY arm at
+// all -- only the fd-2 `sys_write` + `sys_exit(13)` pair below it is
+// wired; the audit call exists only in the `--dry-run` loop (`result_
+// code = PR_RESULT_DRY_RUN`). This is a pre-existing documentation/
+// implementation drift in this repo (`src/audit_wire.pdx`'s header
+// overstates what `src/entry.pdx` actually calls on this path), not
+// something introduced by this driver -- flagged here rather than
+// silently asserted around, since fabricating a passing check against
+// a call site that does not exist would hide the drift instead of
+// surfacing it. This driver therefore documents PR_RESULT_NO_
+// PERMISSION == 3 as the value a future audit-call-site fix should use,
+// without asserting it against a call that is not there yet.
+//
+// ================================================================
+// Return-code convention (matches tests/README.md)
+// ================================================================
+//
+//   0 — every assertion passed.
+//   1 — ElevateGate::pdxping_elevate_check_and_require did not return
+//       EG_DENY (0).
+//   2 — Entry::ep_msg_eacces's 24 bytes do not byte-for-byte match this
+//       driver's own expected "[pdxping.M3-001 EACCES]\n" literal.
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//   - No `add reg, [mem]` anywhere.
+//   - No `test` mnemonic; every check is `cmp`.
+//   - Every `cmp reg, imm` <= 24, well within imm32.
+//   - No `and` on r8-r15.
+//   - Byte loads route through xor+mov_b (#1248), matching
+//     `ArgvParse::_ap_match_prefix`'s own idiom -- this driver writes
+//     its own inline compare loop rather than cross-calling that
+//     underscore-prefixed (module-private-by-convention) helper.
+//   - Cross-file references (`call pdxping_elevate_check_and_require;`,
+//     `[rip + ep_msg_eacces]`) use bare unqualified symbol names,
+//     matching this org's established convention -- unresolved-external
+//     references in this file's own `.o`, resolved only once a future
+//     consumer links `src/` alongside this driver.
+//   - No register survives across the one nested call
+//     (`pdxping_elevate_check_and_require`) that this driver's own
+//     logic needs afterward, so no callee-save push/pop is used.
+//   - Reserved-label discipline: every branch label is prefixed `ped_`
+//     (disjoint from `loop`/`if`/other paideia-as keywords).
+//
+// Upstream: design/networking/r100-user-tools-plan.md §13.4
+// (paideia-os, pdxping#11); src/elevate_gate.pdx, src/entry.pdx,
+// src/ping_record.pdx (this repo, the real modules this driver
+// replays); tests/pdxping_happy_smoke.pdx (this repo, the sibling
+// driver this file's structure is adapted from).
+
+module PdxpingElevateDeniedSmoke = structure {
+
+  // Expected byte-for-byte mirror of Entry::ep_msg_eacces (this repo's
+  // src/entry.pdx) -- 25 bytes including the trailing NUL the storage
+  // array happens to carry, only the first 24 (Entry::ep_msg_eacces_len)
+  // are ever written to fd 2 by a real invocation and are the only
+  // bytes this driver's compare loop below walks.
+  pub let ped_expected_msg : [u8; 25] = "[pdxping.M3-001 EACCES]\n\0"
+
+  // ==========================================================================
+  // run() -> u64
+  // ==========================================================================
+  pub let run : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxping.M4-003 (#11): PdxpingElevateDeniedSmoke::run entry point. call pdxping_elevate_check_and_require (src/elevate_gate.pdx, real, linked, WEAK-but-honestly-fail-closed) -> rax; `cmp rax,0; jne ped_fail_deny` (EG_DENY expected, return 1). Byte-compare loop (rcx = index 0..24): r8=&ped_expected_msg, r9=&ep_msg_eacces (Entry module, cross-file rip-relative reference), per index loads both bytes via xor+mov_b (#1248) into rax/rdx, `cmp rax,rdx; jne ped_fail_msg` (return 2 on first mismatch), else rcx+=1, loop; ped_cmp_done falls through once rcx==24, then `xor rax,rax; ret` (0 -- see module header for why PR_RESULT_NO_PERMISSION is documented, not asserted: no live src/entry.pdx call site passes it on this path today). No `add reg,[mem]`. No `test` mnemonic; every cmp immediate <= 24 (imm32-safe). No `and` on r8-r15. Labels prefixed ped_.",
+      block: {
+        call pdxping_elevate_check_and_require;
+
+        cmp rax, 0;                          // ElevateGate::EG_DENY
+        jne ped_fail_deny;
+
+        // ---- Byte-compare the real 24-byte diagnostic. -----------------------
+        lea r8, [rip + ped_expected_msg];
+        lea r9, [rip + ep_msg_eacces];        // Entry module (src/entry.pdx)
+        xor rcx, rcx;
+
+      ped_cmp_head:
+        cmp rcx, 24;
+        jge ped_cmp_done;
+
+        mov r10, r8;
+        add r10, rcx;
+        xor rax, rax;
+        mov_b rax, [r10];
+
+        mov r11, r9;
+        add r11, rcx;
+        xor rdx, rdx;
+        mov_b rdx, [r11];
+
+        cmp rax, rdx;
+        jne ped_fail_msg;
+
+        add rcx, 1;
+        jmp ped_cmp_head;
+
+      ped_cmp_done:
+        // NOTE: PingRecord::PR_RESULT_NO_PERMISSION (3) is NOT asserted
+        // here -- see module header's "documentation/implementation
+        // drift" section. No live call site in src/entry.pdx passes
+        // this result_code today (AuditWire::pdxping_audit_echo is not
+        // called on the EG_DENY arm at all), so there is nothing this
+        // driver could honestly assert against without fabricating a
+        // check.
+        xor rax, rax;                        // pass
+        ret;
+
+      ped_fail_deny:
+        mov rax, 1;
+        ret;
+
+      ped_fail_msg:
+        mov rax, 2;
+        ret;
+      }
+    }
+}

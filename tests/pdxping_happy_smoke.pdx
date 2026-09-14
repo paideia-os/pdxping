@@ -1,0 +1,259 @@
+// tests/pdxping_happy_smoke.pdx — pdxping.M4-001 (#9)
+// PdxpingHappySmoke: happy-path smoke — echo against a QEMU-reachable
+// gateway (10.0.2.2), a synthetic always-succeeding echo fixture.
+//
+// ================================================================
+// Why this is a pipeline-replay driver, not a literal subprocess-argv
+// invocation, and why the echo primitive is a LOCAL mock, not the real
+// IcmpWire::icmp_wire_echo_one WEAK stub
+// ================================================================
+//
+// `pdxping` is a standalone ring-3 ELF with its own `_start` — not a
+// callable, return-value-bearing function (every path through it ends
+// in a real `sys_exit`), and this repo has no QEMU-boot subprocess-argv
+// harness that could exec the compiled binary, feed it real argv, and
+// report pass/fail back to a `u64`-returning caller (the identical gap
+// `mount.pdxfs`'s own `tests/README.md` documents for its own M4
+// drivers). This driver instead does what `_start` itself does, one
+// call at a time: builds a synthetic argv array for
+// `pdxping --count=3 10.0.2.2`, feeds it through the SAME real, linked
+// `ArgvParse::argv_parse`, then walks a loop shaped identically to
+// `src/entry.pdx`'s `ep_real_grant` `--count` arm (seq/loss_count
+// accumulation), returning a `u64` status instead of the literal
+// "sys_write summary line, sys_exit(0)" a real invocation would
+// produce.
+//
+// `IcmpWire::icmp_wire_echo_one`'s own WEAK stub (src/icmp_wire.pdx)
+// is a FIXED fixture: it always returns `IW_ECHO_OK` at a hardcoded
+// 1.5ms RTT — there is no way to parameterize it to this issue's own
+// requested 2ms RTT, and no link-time "weak symbol" override exists
+// for `pub let`-declared functions in this toolchain (paideia-as's ELF
+// emitter marks only `Data`-kind symbols weak — see
+// `paideia-as-emitter-elf/src/writer.rs`, `PA10-007` — function symbols
+// are always `Global`/strong, so two definitions of the same function
+// name across `.o` files is a link-time collision, not an override).
+// This driver therefore declares its own distinctly-named local fixture,
+// `_phs_mock_echo_ok`, matching `icmp_wire_echo_one`'s exact call
+// signature and return-value convention (`rax`=echo_ok, `rdx`=rtt_ns)
+// but fixed at the RTT this issue's own spec requests (2ms) — a drop-in
+// substitute for the real stub in this driver's own loop, not an
+// override of it.
+//
+// ================================================================
+// The "fingerprint" this driver asserts
+// ================================================================
+//
+// This issue's own acceptance text asks to assert the
+// "3 transmitted, 3 received, 0% loss" fingerprint `src/entry.pdx`'s
+// `_er_emit_summary` would print for a 3-iteration all-success run.
+// This driver does not invoke `_er_emit_summary` itself (that function
+// performs a real `sys_write` to fd 1, which this compile-only,
+// never-linked driver has no way to capture and diff), so it instead
+// recomputes the SAME three numbers `_er_emit_summary` would print,
+// via the SAME formula (`received = count - loss_count`, `loss_pct =
+// (loss_count * 100) / count` via the shl3+shl1+add `*10`-composition
+// twice, matching `_er_emit_summary`'s own imul-avoidance idiom) and
+// asserts each against the fingerprint's literal numbers: count == 3
+// (transmitted), received == 3, loss_pct == 0.
+//
+// ================================================================
+// Return-code convention (matches tests/README.md)
+// ================================================================
+//
+//   0 — every assertion passed (the fingerprint holds).
+//   1 — ArgvParse::argv_parse did not return AP_OK.
+//   2 — ParsedArgv.count != 3 (AP_OFF_COUNT).
+//   3 — ParsedArgv.host_ptr is unset (AP_OFF_HOST_PTR == 0).
+//   4 — received != 3 after the loop (a loss occurred against the
+//       always-succeeding mock — would indicate a driver-loop
+//       regression, not a real network fault).
+//   5 — loss_pct != 0.
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//   - No `add reg, [mem]` anywhere.
+//   - No `test` mnemonic; every check is `cmp reg, imm`/`cmp reg, reg`.
+//   - Every `cmp reg, imm` <= 2000000, well within imm32.
+//   - No `and` on r8-r15.
+//   - No 2-op `imul`; the one `*100` uses the shl3+shl1+add `*10`
+//     composition twice, copied from `src/entry.pdx`'s own
+//     `_er_emit_summary`.
+//   - Cross-file call (`call argv_parse;`) uses the bare unqualified
+//     symbol name, matching this org's established convention
+//     (`mount.pdxfs`'s own `tests/*.pdx`) — `tools/build.sh` compiles
+//     this file standalone with no link step; this is an
+//     unresolved-external reference in this file's own `.o`.
+//   - Register plan: no callee-save push/pop — loop state
+//     (`phs_seq`/`phs_loss_count`) is memory-resident (.bss), reloaded
+//     fresh around the one nested call per iteration
+//     (`_phs_mock_echo_ok`), mirroring `src/entry.pdx`'s own
+//     `ep_real_grant` arm's documented register-budget tradeoff.
+//   - Reserved-label discipline: every branch label is prefixed `phs_`
+//     (disjoint from `loop`/`if`/other paideia-as keywords).
+//
+// Upstream: design/networking/r100-user-tools-plan.md §13.4
+// (paideia-os, pdxping#9); src/argv_parse.pdx, src/icmp_wire.pdx,
+// src/entry.pdx (this repo, the real modules this driver replays);
+// tools/user/mount.pdxfs/tests/README.md (paideia-os monorepo
+// checkout, the pipeline-replay-driver convention this file follows).
+
+module PdxpingHappySmoke = structure {
+
+  pub let phs_argv_str0 : [u8; 8]  = "pdxping\0"
+  pub let phs_argv_str1 : [u8; 10] = "--count=3\0"
+  pub let phs_argv_str2 : [u8; 9]  = "10.0.2.2\0"
+
+  pub let mut phs_argv_vec : [u8; 24] = uninit @align(8)   // char*[3]
+  pub let mut phs_parsed   : [u8; 40] = uninit @align(8)   // ParsedArgv (ArgvParse::AP_STRUCT_BYTES)
+
+  pub let mut phs_seq        : u64 = uninit @align(8)
+  pub let mut phs_loss_count : u64 = uninit @align(8)
+
+  // ============================================================================
+  // _phs_mock_echo_ok(ip_be, seq, timeout_ms) -> u64
+  //
+  //   rax (out) = echo_ok (IcmpWire::IW_ECHO_OK, 1 — always succeeds)
+  //   rdx (out) = rtt_ns  (2,000,000 ns = 2ms, fixed — this issue's own
+  //               mock spec, distinct from the real icmp_wire_echo_one
+  //               WEAK stub's fixed 1.5ms)
+  //
+  // Local test-only fixture — see file header for why a distinct local
+  // mock, not the real WEAK stub, is used. Pure leaf: touches only
+  // rax/rdx, so rbx/r12-r15 survive a call to this function untouched,
+  // the same guarantee IcmpWire::sys_icmp_echo's own header documents.
+  // ============================================================================
+  pub let _phs_mock_echo_ok : (u64, u64, u64) -> u64 !{} @{} =
+    fn (ip_be: u64) (seq: u64) (timeout_ms: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "pdxping.M4-001 (#9) _phs_mock_echo_ok. Local fixture standing in for IcmpWire::icmp_wire_echo_one — see file header for why (this issue's own spec pins rtt=2ms, distinct from the real WEAK stub's fixed 1.5ms, and paideia-as's ELF emitter never marks function symbols weak, so a real override is not possible). Body: mov rax,1 (IW_ECHO_OK); mov rdx,2000000 (2ms in ns); ret. Discards ip_be/seq/timeout_ms (rdi/rsi/rdx, all caller-save). Pure leaf -- touches only rax/rdx. No branch, no test mnemonic. Labels: none.",
+      block: {
+        mov rax, 1;                          // IW_ECHO_OK
+        mov rdx, 2000000;                    // 2ms in ns
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // run() -> u64
+  // ==========================================================================
+  pub let run : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxping.M4-001 (#9): PdxpingHappySmoke::run entry point. Builds a synthetic argv vector (phs_argv_vec[0..3) = &phs_argv_str0/1/2, i.e. 'pdxping --count=3 10.0.2.2') via three lea+mov stores, then argv_parse(argc=3, argv=&phs_argv_vec, out=&phs_parsed); `cmp rax,0; jne phs_fail_argv` (AP_OK expected, return 1). Loads count=[phs_parsed+0] (AP_OFF_COUNT), asserts ==3 (`cmp rax,3; jne phs_fail_count`, return 2); loads host_ptr=[phs_parsed+32] (AP_OFF_HOST_PTR), asserts !=0 (`cmp rax,0; je phs_fail_host`, return 3). Zeroes phs_seq/phs_loss_count. phs_loop_head: reloads seq from phs_seq, `cmp rax,3; jge phs_loop_done`; per iteration calls _phs_mock_echo_ok(ip_be=0, seq, timeout_ms=1000 fixed placeholder -- the mock discards it) -> rax=echo_ok; `cmp rax,1; je phs_next` (IW_ECHO_OK, skip the loss increment); otherwise increments phs_loss_count. phs_next: increments phs_seq, loops. phs_loop_done: r8=loss_count (reloaded from phs_loss_count); received = 3 - r8, `cmp rax,3; jne phs_fail_received` (return 4, expects the always-succeeding mock to produce zero loss). loss_pct = (loss_count*100)/count via the shl3+shl1+add *10 composition twice (mirrors Entry::_er_emit_summary's own imul-avoidance idiom; count=3 is a compile-time-known nonzero literal in this fixture, so the real code's count==0 guard is not needed here), then one `div` by 3; `cmp rax,0; jne phs_fail_loss` (return 5). All passing falls to `xor rax,rax; ret` (0). No `add reg,[mem]`. No `test` mnemonic; every cmp immediate <= 2000000 (imm32-safe). No `and` on r8-r15. No 2-op imul. Labels prefixed phs_.",
+      block: {
+        // ---- Build synthetic argv: pdxping --count=3 10.0.2.2 ---------------
+        lea r11, [rip + phs_argv_vec];
+        lea rax, [rip + phs_argv_str0];
+        mov [r11 + 0], rax;
+        lea rax, [rip + phs_argv_str1];
+        mov [r11 + 8], rax;
+        lea rax, [rip + phs_argv_str2];
+        mov [r11 + 16], rax;
+
+        mov rdi, 3;
+        lea rsi, [rip + phs_argv_vec];
+        lea rdx, [rip + phs_parsed];
+        call argv_parse;
+
+        cmp rax, 0;                          // ArgvParse::AP_OK
+        jne phs_fail_argv;
+
+        // ---- count == 3 -------------------------------------------------------
+        lea r11, [rip + phs_parsed];
+        mov rax, [r11 + 0];                  // AP_OFF_COUNT
+        cmp rax, 3;
+        jne phs_fail_count;
+
+        // ---- host_ptr set -------------------------------------------------------
+        mov rax, [r11 + 32];                 // AP_OFF_HOST_PTR
+        cmp rax, 0;
+        je phs_fail_host;
+
+        // ---- init loop state ------------------------------------------------------
+        xor rax, rax;
+        lea r11, [rip + phs_seq];
+        mov [r11 + 0], rax;                  // phs_seq = 0
+        lea r11, [rip + phs_loss_count];
+        mov [r11 + 0], rax;                  // phs_loss_count = 0
+
+      phs_loop_head:
+        lea r11, [rip + phs_seq];
+        mov rax, [r11 + 0];
+        cmp rax, 3;
+        jge phs_loop_done;
+
+        xor rdi, rdi;                        // ip_be placeholder (no DNS/IP-resolve)
+        mov rsi, rax;                        // seq
+        mov rdx, 1000;                       // timeout_ms (fixed placeholder; mock discards it)
+        call _phs_mock_echo_ok;              // rax = echo_ok, rdx = rtt_ns (unused here)
+
+        cmp rax, 1;                          // IW_ECHO_OK
+        je phs_next;
+
+        lea r11, [rip + phs_loss_count];
+        mov rax, [r11 + 0];
+        add rax, 1;
+        mov [r11 + 0], rax;
+
+      phs_next:
+        lea r11, [rip + phs_seq];
+        mov rax, [r11 + 0];
+        add rax, 1;
+        mov [r11 + 0], rax;
+        jmp phs_loop_head;
+
+      phs_loop_done:
+        lea r11, [rip + phs_loss_count];
+        mov r8, [r11 + 0];                   // r8 = loss_count
+
+        mov rax, 3;                          // count
+        sub rax, r8;                         // received = count - loss_count
+        cmp rax, 3;
+        jne phs_fail_received;
+
+        // ---- loss_pct = (loss_count * 100) / count, no imul ------------------
+        mov rcx, r8;                         // loss_count
+        mov r10, rcx;
+        shl r10, 3;                          // loss*8
+        mov r9, rcx;
+        shl r9, 1;                           // loss*2
+        add r10, r9;                         // loss*10
+        mov r9, r10;
+        shl r10, 3;                          // (loss*10)*8
+        shl r9, 1;                           // (loss*10)*2
+        add r10, r9;                         // loss*100
+
+        mov rax, r10;
+        mov rcx, 3;                          // divisor = count
+        xor rdx, rdx;
+        div rcx;                             // rax = loss_pct
+
+        cmp rax, 0;
+        jne phs_fail_loss;
+
+        xor rax, rax;                        // pass -- fingerprint holds
+        ret;
+
+      phs_fail_argv:
+        mov rax, 1;
+        ret;
+
+      phs_fail_count:
+        mov rax, 2;
+        ret;
+
+      phs_fail_host:
+        mov rax, 3;
+        ret;
+
+      phs_fail_received:
+        mov rax, 4;
+        ret;
+
+      phs_fail_loss:
+        mov rax, 5;
+        ret;
+      }
+    }
+}

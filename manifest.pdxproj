@@ -1,14 +1,15 @@
 # pdxping -- paideia-as build manifest
 #
 # Wave: R100  Milestone: M1-001/M1-002/M1-003/M3-001/M3-002 (Wave AA
-# cohort) + M2-001/M2-002/M3-003 (Wave BB follow-up)
+# cohort) + M2-001/M2-002/M3-003 (Wave BB follow-up) + M4-001/M4-002/
+# M4-003/M5-001/M5-002 (Wave ZZ tail)
 # Doc:  design/networking/r100-user-tools-plan.md §5 + §13 (paideia-os repo).
 #
 # Consumed by `paideia-as build` (release-time signer path) and by the
 # tools/build.sh iterator (`src/*.pdx` glob) at day-to-day build time.
 
 name        = pdxping
-version     = 1.1.0
+version     = 1.2.0
 kind        = tool
 entry       = _start                    # src/entry.pdx
 output      = build-out/pdxping.elf
@@ -45,10 +46,17 @@ sources:
 deps: []
 
 # --- Test targets ------------------------------------------------------
-# M4 smokes (happy dry-run, elevate-denied path, real-echo-loop once
-# reachable) are deferred to a future milestone -- not part of this
-# landing (pdxping#1/#2/#3/#4/#5/#6/#7/#8 only).
-tests: []
+# M4 (#9/#10/#11) lands at v1.2.0: three pipeline-replay smoke drivers,
+# each exporting `run() -> u64` (see tests/README.md for the full
+# convention and why these are drivers, not literal subprocess-argv
+# invocations). tools/build.sh's own `tests/*.pdx` glob compiles each to
+# verify it assembles; none are linked or executed at this landing (no
+# QEMU-boot argv/subprocess harness exists yet for a standalone CLI
+# tool in this wave).
+tests:
+  - tests/pdxping_happy_smoke.pdx           # M4-001 (#9): happy-path, QEMU-reachable gateway
+  - tests/pdxping_timeout_smoke.pdx         # M4-002 (#10): timeout-path, unreachable host
+  - tests/pdxping_elevate_denied_smoke.pdx  # M4-003 (#11): elevate-denied-path, fail-closed
 
 # --- Documentation targets ---------------------------------------------
 docs:
@@ -66,14 +74,18 @@ compliance:
 
 # --- Release policy ----------------------------------------------------
 # v1.0.0 was the Wave AA cohort landing (pdxping#1/#2/#3/#6/#7); v1.1.0
-# adds the Wave BB follow-up (pdxping#4/#5/#8). The source form of the
-# manifest lives at the repo root, `manifest.pdxsig`
-# (paideia-manifest-pdxsig@1 schema, hybrid-ed25519+ml-dsa-65 signature
-# scheme), with every hash and every signature slot a documented
-# placeholder the release tool fills in at tag time. The dual-sign
-# pass itself is NOT performed at this landing -- release-line seed
-# keys are hardware-backed / KMS-custody per paideia-os design/02-
-# development-environment.md §1164 and never repo-resident.
+# added the Wave BB follow-up (pdxping#4/#5/#8); v1.2.0 (this landing)
+# adds the Wave ZZ tail: M4 smoke drivers (#9/#10/#11) + the M5 signed
+# release itself (#12/#13). The source form of the manifest lives at the
+# repo root, `manifest.pdxsig` (paideia-manifest-pdxsig@1 schema,
+# hybrid-ed25519+ml-dsa-65 signature scheme), with every hash and every
+# signature slot a documented placeholder the release tool fills in at
+# tag time. The dual-sign pass itself is NOT performed at this landing
+# -- release-line seed keys are hardware-backed / KMS-custody per
+# paideia-os design/02-development-environment.md §1164 and never
+# repo-resident. The mirror push (#13) is likewise placeholder scaffolding
+# -- see release/mirror-push.md for the full write-up of why (blocked on
+# release-infra R32).
 release:
   signer_author  = paideia-release-line  # placeholder-until-sign; see
                                           # manifest.pdxsig [signatures]
@@ -81,5 +93,5 @@ release:
                                           # PLACEHOLDER_PENDING_LIVE_SIGN
                                           # sentinel the dual-sign pass
                                           # replaces.
-  mirror_target  = pkgs.paideia-os/main/pdxping/1.1.0/   # future mirror push
+  mirror_target  = pkgs.paideia-os/main/pdxping/1.2.0/   # future mirror push; see release/mirror-push.md
   manifest_src   = manifest.pdxsig                       # source form of manifest.pdxsig
